@@ -4,7 +4,8 @@ description: >-
   Perform comprehensive GitHub PR review: analyze changes, check compliance with
   project rules (AGENTS.md, planning docs, design system), cross-reference
   existing reviewer comments, and post inline review comments via gh CLI.
-  Use when the user shares a PR URL or asks to review a pull request.
+  Use when the user shares a PR URL, asks to review a pull request, says
+  "check this PR", "code review", "review #123", or "look at my changes".
 ---
 
 # PR Review Workflow
@@ -53,7 +54,44 @@ Collect all inputs in parallel:
 
 ## Step 2: Analyze the PR
 
-For each changed file, evaluate against:
+### Foundational Review Principles
+
+These four principles govern every check below. Violating them produces low-quality reviews.
+
+**1. Evidence-Based Review — verify against real code, not assumptions.**
+Every claim in a review comment must be backed by evidence from the actual codebase. Before flagging an issue:
+- **Read the real type definition / SDK export** — don't assume a field is optional; check the `.d.ts` or source. If the SDK types say `id: string` (required), an empty-string guard is unnecessary.
+- **Trace the actual call path** — don't guess what a function does; read it. If `ScopedDb.selectFrom` already applies `deletedAt IS NULL`, flagging it as missing is noise.
+- **Check test fixtures and CI** — if you claim "this test will fail", verify against the actual mock shape. If you claim "this throws at runtime", confirm the runtime type doesn't prevent it.
+- **When uncertain, say so** — "I couldn't verify whether X is guaranteed here — worth checking" is more valuable than a false-positive P1.
+
+**2. Third-Party Verification — web-search external API docs, don't invent constraints.**
+When a review touches external services (Stripe, Composio, Vapi, AWS, Auth0, etc.):
+- **Search the actual docs** for constraints before flagging. Example: Stripe rejects `timestamp` older than 35 calendar days AND more than 5 minutes in the future — cite the docs URL.
+- **Check SDK behavior** — e.g., does `react-markdown` v10 render raw HTML by default? (No — no `rehype-raw` plugin.) Check, don't guess.
+- **Cite the reference** in your comment: "Per Stripe docs (https://docs.stripe.com/api/billing/meter-event/create), timestamp must be within past 35 days."
+- **Never fabricate API constraints** — a wrong external constraint in a review wastes the author's time verifying your fiction.
+
+**3. User Perspective — trace the user journey, not just the code path.**
+For every behavioral change, ask: "What does the end user / operator / on-call actually experience?"
+
+- **UI/UX — Visual consistency**: Labels, badges, and status indicators must match across all views. If one view shows "ACTIVE" and another shows "active", that's a bug the user sees.
+- **UI/UX — Interaction integrity**: Filter and search state must never orphan (dropdown shows a value that doesn't exist in options). Focus must never be stolen unexpectedly (e.g., agent dropdown change shouldn't yank focus to textarea). Pagination must not shift unrelated content (global "Show More" shouldn't reorder groups above the fold).
+- **UI/UX — Information preservation**: Search results must retain context (show category chips when group headers are hidden). Grouped views must be stable on expand — clicking "Show More" must not shuffle existing items.
+- **UI/UX — Workflow continuity**: Filter/search state should survive page reload (URL-backed via `?search=` / `?category=`). Loading and error states must always be visible — silent failures are UX bugs. URLs should be shareable (if a user copies the URL and sends it to a teammate, the teammate should see the same view).
+- **Operator experience**: Log-level choices affect on-call. `debug` level for a revenue-impacting skip means no one notices until monthly revenue dips. Revenue, billing, and security events need `warn` or `info` minimum. Dashboard visibility matters — if a behavioral change causes an alerting spike, call it out in the PR description.
+- **Business impact**: Silent data loss (e.g., swallowing billing errors) is a business bug, not just a code bug. Trace the failure mode to the business consequence.
+
+**4. Don't Manufacture Issues — if the code is clean, say so.**
+A review that pads findings with noise erodes trust. Before posting a comment, ask: "Would this cause a real problem, or am I nitpicking to fill space?"
+- **Don't force every observation into a critique** — if a pattern is unusual but correct, note it as "VERIFIED" rather than inventing a concern.
+- **Nitpicks must be labeled as such** — use `[NITPICK]` or P3 so the author knows it's optional.
+- **Don't flag theoretical risks with no practical exploit path** — "if someone passes negative infinity here" is not useful unless the input is user-controlled.
+- **Positive verification is part of a thorough review** — marking verified-safe patterns (e.g., "SECURITY VERIFIED — tenant isolation holds because ScopedDb always applies orgId filter", "CHAIN VERIFIED — delete flow has layered ownership checks") shows the review was rigorous, not just looking for problems.
+
+---
+
+For each changed file, evaluate against the following categories:
 
 ### Architecture & Code Rules (from AGENTS.md + planning docs)
 
@@ -69,23 +107,104 @@ Check against all rules read from AGENTS.md. Common violations to watch for:
 - Use `ValidationError` / `NotFoundError` / `ForbiddenError` — never raw `throw new Error()` in routes/services
 - Terraform: update module README when changing variables/resources/scopes
 - No client-side secrets (`NEXT_PUBLIC_*` forbidden)
+- **Specialized helper preference** — when a helper family exists (`with-system-db.ts` exports `withSystemDb` + `withBootstrapSystemDb`; `with-scoped-db.ts` exports `withScopedDb` + `withScopedDbForOrg` + ...), the most specific helper wins. A bootstrap path manually constructing a `SystemDbContext` and calling `withSystemDb(ctx, fn)` should be `withBootstrapSystemDb(reason, fn)` — review-time check: `rg "withSystemDb\\(" apps/api/src` and audit each site for whether a more specific helper applies (PR #1059).
 
-### Cross-Layer & Multi-Context Consistency
+### Behavioral Change Flagging
 
-- **Fallback chain alignment**: When the same value (e.g., brand, locale, feature flag) is resolved in multiple layers (e.g., JS runtime, Liquid/Handlebars templates, Terraform locals, subject lines), verify all layers use the **same fallback chain** in the same order. Divergent chains cause subtle inconsistencies (e.g., email From says "BookingBoost" but Subject says "Aetheron Connect").
-- **Dead fallbacks / phantom data dependencies**: If code adds a fallback to a field (e.g., `user.app_metadata.brand`), verify something in the system **actually writes that field**. A fallback to unwritten data is dead code that gives false confidence. Flag it: "Nothing sets `X` — this fallback is unreachable."
-- **Planning doc alignment**: When a PR adds new patterns, check whether existing planning docs describe a **different target direction** for the same area. If `planning/org-branding.md` says "eliminate per-brand conditionals" but the PR adds more, flag the contradiction. The PR should either align with the plan or explicitly update the planning doc to document the exception.
+When code changes observable behavior (not just refactoring), explicitly flag it and ask whether it's intentional:
+- **Side effects of refactoring**: Extracting a function may change when/where a side effect fires. E.g., wiring `handleResetChat` to a dropdown `onChange` now steals focus on every agent change — was that intended, or should focus only fire from explicit "New Chat" actions?
+- **Removed UI elements**: If a label, badge, or status indicator is removed while sibling elements are kept, flag the visual inconsistency. "System message label removed but agent label kept — intentional?"
+- **Changed error propagation**: If errors that were previously swallowed now propagate (or vice versa), trace the operational impact. "Stripe errors now throw → on-call will see webhook retry spikes during outages where it previously saw silence."
+- **Changed data scope**: Switching from user-scoped to org-scoped queries changes who sees what. Trace the tenancy implications.
+- **Variable value-domain changes (second-order side effects)**: When a PR changes a variable's possible values (e.g., from "always non-null" to "possibly null" via a new conditional/dedup path), search for ALL downstream consumers of that variable in the same function. The consumer code may not be in the PR diff but can break silently. E.g., adding dedup that sets `assistantEvent = null` breaks a downstream `touchSession(lastEventAt: assistantEvent.createdAt)` that assumed non-null.
+- **Conditional skip / dedup bypassing side effects**: When a PR adds a conditional skip (dedup, early return, guard clause), trace every side effect in the skipped code path. If any are still needed (metadata updates, timestamps, counters, cache invalidation), flag the gap. The primary behavior may work perfectly while metadata drifts silently.
+- **Buffer-then-flush vs centralized fan-out**: When a PR persists agent / SDK events via an in-memory buffer that drains after the run completes (`bufferedEvents.push(...)` in `onMessage`, `for (const ev of bufferedEvents) await appendEvent(ev)` after `runAgent` resolves), check `planning/engine/sessions.md` for the centralization mandate. Buffer-then-flush means refresh during a 60s+ tool-using run still sees nothing — exactly the V2-380-class symptom mid-run. Either flag for centralization (write through `onMessage` live) or push back to tighten the AC wording in the PR description to "post-run only" (PR #997).
+
+### Concurrency & Race Conditions
+
+- **Async race conditions**: When an async operation is started without `await` and a dependent action follows immediately (e.g., `loadSession(id); focusComposer()`), the dependent action can fire before the async work completes. On slow networks, users may interact with stale state.
+- **Database concurrency**: `SELECT → decide → INSERT/UPDATE` inside a transaction gives atomicity but not isolation. Two concurrent callers on the same unique key (e.g., sync-write and reconcile on `(orgId, provider, externalId)`) can both SELECT "not found" and both INSERT, causing a 23505 unique violation. Handle with: catch 23505 + retry, or `INSERT ... ON CONFLICT`, or `SELECT ... FOR UPDATE`.
+- **Status flip-flop across write paths**: When multiple code paths write to the same column (e.g., sync-write writes `'ACTIVE'` uppercase, reconcile writes `best?.status` lowercase from SDK), every write triggers a spurious UPDATE. Normalize with a shared canonicalization function.
+- **React concurrent mode**: `requestAnimationFrame` is not guaranteed to fire after React has committed state in concurrent mode. Use `useEffect` keyed on the relevant state instead.
+- **Timer/interval leaks**: `setTimeout` / `setInterval` in components must be cleared on unmount. Without cleanup, callbacks fire on unmounted components.
+- **React effect trigger vs latest-read separation**: For effects that hydrate persisted state (localStorage/session/URL-backed state), check whether deps represent true business triggers (namespace keys, route params, entity ids) or unstable tool identities (`loadSession`, `resetChat`, translation callbacks). If the effect should react only to the trigger but needs latest callbacks, use `useEffectEvent` rather than listing callback identities that can re-run hydration on ordinary renders.
+- **Self-cancel from synchronous state writes**: Trace whether an async action called inside an effect synchronously sets a state value that is also in that effect's deps. Example: `loadSession(storedId)` sets `sessionId` before awaiting history; if `sessionId` is a dep, the effect cleanup can mark the first run `cancelled=true`, causing `.finally()` cleanup (`setHydrating(false)`, readiness updates) to be skipped.
+- **Hydration readiness side-effect gaps**: When an effect marks a namespace/state as PENDING, every branch must either mark it READY or intentionally keep it blocked with a user-visible reason. Early returns for stale `sessionId`, selected-session bypasses, missing stored ids, or superseded loads must be traced so persistence watchers do not silently drop new state.
+- **Cancelled load cleanup gaps**: If a namespace/key change cancels an in-flight async load, verify the new run resets loading/hydrating state before any early return. Otherwise the old `.finally()` may skip cleanup due to `cancelled=true`, and the new empty namespace may suppress the empty state forever.
+- **Framework-level race prevention**: Before flagging a timing race condition, verify whether the framework prevents it internally. E.g., Next.js `router.replace` wraps navigation in `startTransition` and uses an action queue that **discards** superseded pending navigations (`app-router-instance.js` `dispatchAction`). Consecutive rapid `router.replace` calls don't produce intermediate `searchParams` values — the old navigate is discarded before its state is committed. Read the framework source when official docs are silent on internal behavior. Don't flag theoretical race conditions that the framework's architecture prevents.
+- **Global state vs error-shape discriminators in catch blocks**: When a catch block uses _global state_ (`request.signal.aborted`, module-level flags, request-scoped booleans) to decide how to handle an error, verify no other error path can reach the same state. E.g., `request.signal.aborted === true` holds for any error that happens after a client disconnect — including genuine upstream failures (DNS, ECONNREFUSED, TLS) that coincided with the disconnect — causing silent swallowing of real bugs. Prefer error-shape discriminators: `err instanceof DOMException && err.name === 'AbortError'`. This matches the codebase's existing pattern in `useChat.ts:605` / `useChat.ts:723` / `query-retry.ts:43`.
+
+### External API Integration
+
+- **Pagination completeness**: Any call to a paginated external API (e.g., `connectedAccounts.list`) must drain all pages via cursor/offset. Returning only the first page silently truncates data. After switching from user-scoped to org-scoped queries, the result set can grow dramatically.
+- **Safety caps on pagination**: Cursor-based loops (`do { ... } while (cursor)`) must have a `MAX_PAGES` cap. A stuck cursor (API returns the same value repeatedly) can infinite-loop. Log a warning when the cap is hit so truncation is visible in observability.
+- **Time window constraints**: External APIs often reject timestamps outside a window. E.g., Stripe meter events reject timestamps older than 35 calendar days or more than 5 minutes in the future. When deriving timestamps from stored data (e.g., `interaction.endedAt`), the value can be arbitrarily old during replays.
+- **Idempotency key stability**: Idempotency keys (e.g., Stripe `eventId`) must be stable across retries. Using an application-generated UUIDv7 (`interaction.id`) that regenerates on transaction rollback breaks idempotency — use a stable external ID (e.g., `providerId`) instead.
+- **SDK documented guidance**: When using an SDK hook (e.g., Composio `afterExecute`) for a purpose beyond its documented intent (data transformation), document the deviation and risk mitigations.
+- **SDK schema verification — silent parameter stripping**: When an SDK uses Zod `safeParse` for input validation (most modern SDKs do), unknown keys are **silently stripped**. A parameter that looks correct in the call site can be a complete no-op if it's not in the SDK's schema. **Always verify by reading the actual SDK schema** in `node_modules/.pnpm/{package}/dist/*.mjs` — search for the relevant `z.object({...})` definition. E.g., `@composio/core@0.6.4`'s `ConnectedAccountListParamsSchema` includes `orderBy` but NOT `orderDirection`, so `orderDirection: 'desc'` is dead code (PR #919).
+- **SDK source over docs**: When SDK docs are incomplete or ambiguous on default sort order, available parameters, or API scope, read the SDK source directly. Check what's in the Zod schema, what fields are mapped to the API request, and what transformations are applied. This is the only reliable way to verify behavior.
 
 ### Security
 
-- **SSRF prevention (backend only)**: Server-side code (`apps/api/`) that accepts a URL and fetches it must validate the hostname against an allowlist and add `redirect: 'manual'` to block redirect-based SSRF. **This rule does NOT apply to client-side code** (`apps/web/`) — browsers handle CORS/same-origin natively. For frontend presigned URL fetches, a hostname allowlist is sufficient; `redirect: 'manual'` on the client actually breaks S3 cross-region 307 redirects.
-- **Unbounded async fan-out**: `Promise.all` over user-controlled-length arrays (e.g., S3 object lists, webhook logs) needs a cap. Without `MaxKeys` or a hard limit, a single request can trigger thousands of downstream calls (DoS risk). If the fan-out is CPU-only (e.g., presigned URL generation via local HMAC signing), add a comment documenting why it's safe.
+- **SSRF prevention (backend only)**: Server-side code (`apps/api/`) that accepts a URL and fetches it must validate the hostname against an allowlist and add `redirect: 'manual'` to block redirect-based SSRF. **This rule does NOT apply to client-side code** (`apps/web/`).
+- **Unbounded async fan-out**: `Promise.all` over user-controlled-length arrays needs a cap or concurrency limit.
+- **Ownership chain verification**: When a function gates access (e.g., `verifyAccountOwnership`), trace ALL callers. A broad `catch` that converts all errors to `NotFoundError` can silently pass through transient failures (429, 500), weakening IDOR protection. Only map the specific "not found" error; let others propagate.
+- **Error fallbacks weakening security**: If a delete/refresh flow treats `NotFoundError` as "already gone, skip cleanup", then converting transient errors to `NotFoundError` means transient failures silently skip cleanup. Narrow the catch to the exact 404-equivalent.
+- **Tenant isolation on new patterns**: When introducing `includeDeleted`, `withTombstones`, or similar query modifiers, verify they don't bypass the `orgId` tenant filter. Read the actual `ScopedDb` implementation to confirm.
+- **Default-deny direction of failures**: When a safety cap (e.g., MAX_PAGES) truncates data, the failure direction matters. For ownership verification, truncation should result in `NotFoundError` (deny access), not silent pass-through. For data listing, truncation loses data but doesn't open a security hole — log a warning.
+
+### Operational Readiness
+
+- **Log level appropriateness**: Revenue-impacting skips, security-relevant events, and unexpected upstream data must log at `warn` or `info`, not `debug`. `debug` is invisible at production log levels. The "no Stripe customer" skip is fine at `debug` (expected state); "no billable duration" needs `warn` (unexpected, may indicate upstream schema drift).
+- **`logger.warn` doesn't reach Sentry**: The `sentryLogHook` in `packages/sentry/src/log-hook.ts:27` only captures at level >= 50 (`error` / `fatal`). For user-visible content failures (e.g. `.catch(() => log.warn({ err }, 'Failed to persist'))` swallowing assistant prose), the `warn` level means the failure rate is uncomputable from Sentry — silent data loss with no alert. Recommend either bumping to `logger.error` so the hook fires, or calling `Sentry.captureException(err, { tags: { ... } })` explicitly. Validation: `apps/workloads/src/lib/logger.test.ts:76` (PR #997).
+- **Structured logging vs console.warn**: `console.warn` doesn't appear in CloudWatch structured log queries or Datadog dashboards. Operationally meaningful events must use the pino logger, not `console.*`.
+- **Observability counters**: When a planning doc specifies metrics (e.g., `syncFailed`, `statusDriftDetected`), verify the implementation actually tracks and logs them. Missing counters mean missing SLO signals.
+- **Logger error payload structure for triage**: When a catch logs an error, the payload should include enough structured context for triage: e.g. `log.error({ err, blockType: 'text', sessionId, agentId }, '...')` rather than `{ err }` alone. Without `blockType`, four call shapes (text, tool_use, thinking, tool_result) collapse into one Sentry issue and can't be bisected (PR #997).
+- **Audit trail completeness**: When `withScopedDb` is called, check whether `userId`, `requestId`, and `reason` are set. Audit trigger columns getting `null` means forensic queries can't trace who triggered the write.
+- **Runbook/rollout notes**: When a PR changes error propagation or alerting behavior, the PR description must document the operational impact. E.g., "On-call will see webhook retry spikes during Stripe outages where it previously saw silence."
+
+### Sentry & Replay Configuration
+
+When a PR touches `sentry.client.config.ts` / `sentry.server.config.ts` / `Sentry.captureException` sites / Sentry filters / replay configuration, also apply the patterns in the dedicated **`sentry-observability`** skill. Common review checks:
+
+- **`ignoreErrors` vs `beforeSend`**: `ignoreErrors` drops events at the SDK level — also dropping the on-error replay buffer (replays attach AFTER `ignoreErrors` runs) and any explicit `Sentry.captureException` with diagnostic tags. For noise filtering with canary sampling and tag-aware bypass, `beforeSend` is correct.
+- **Tag-aware bypass coverage**: When a `beforeSend` filter bypasses tagged captures (`'errorBoundary' in event.tags`), audit ALL `Sentry.captureException` sites for the bypass tag. Common misses: `useChat.ts` `loadSession` capture, `QueryProvider.tsx` retry-exhausted fallback (PR #1039).
+- **Replay coupling documentation**: `beforeSend` returning `null` discards the on-error replay too, even with `replaysOnErrorSampleRate: 1`. Require an inline comment so the next reader doesn't assume replay survives.
+- **Engine-agnostic constant naming**: When a regex covers multiple browsers (`Failed to fetch` Chromium + Firefox, `Load failed` Safari), name it `TRANSIENT_FETCH_FAILURE`, not `CHROMIUM_FETCH_FAILURE`.
+- **Canary sampling math**: `2 ** 32` reads better than `0x100000000` and avoids the off-by-one of `0xFFFFFFFF` (which maps the max sample to exactly 1.0).
+
+### Cross-Service Data Consistency
+
+- **Multiple write paths for the same data**: When sync-write, reconcile, and detail-endpoint all derive the same field (e.g., `effectiveStatus`), all paths must use the same normalization. One writing uppercase and another writing lowercase causes UPDATE churn on every cycle.
+- **Data carry-forward correctness**: When reading existing rows before upserting, prefer live rows over tombstones. If a tombstone and a live row coexist for the same key, carrying forward the tombstone's metadata overwrites the live row's data.
+- **DRY across app boundaries**: Near-verbatim copies of business logic across `apps/api` and `apps/workloads` (e.g., `upsertManagedApp` vs `upsertByExternalId`) are a maintenance hazard. "Must stay in sync" comments are not enforcement. Flag for extraction to a shared package.
+- **Enum/status value consistency**: When an external SDK returns lowercase values (e.g., `"active"`) but the codebase uses uppercase (`"ACTIVE"`), normalize at the boundary. Inconsistency causes spurious writes, wrong UI filtering, and status flip-flop.
+- **JSONB column type awareness**: Kysely returns JSONB columns as **parsed JS objects** (not strings). Code that checks `typeof metadata === 'string'` will always be false for JSONB data from the DB. This is a common source of silent bugs in merge/comparison logic — e.g., `mergeMetadataJson` using `typeof existing !== 'string'` to guard against non-string input actually skips the merge for every DB-sourced value, losing critical fields like `slackAppId` during tombstone resurrection (PR #919). When reviewing metadata merge/compare logic, verify the code handles both string inputs (from `JSON.stringify`) and object inputs (from DB reads).
+- **Metadata preservation on resurrection**: When a tombstone row is resurrected, metadata must be **merged** (spread existing + incoming), not **overwritten**. Fields like `slackAppId` in metadata are critical for cleanup flows (`deleteIntegration` → `parseSlackAppId` → Slack App cleanup). Overwriting loses them, creating orphans that are unrecoverable from the row alone.
+- **Strip output markers consistently across paths**: When the same content is emitted on a live path (SSE) and a persisted path (DDB / Postgres), every path that reads or stores the text must run the same scrub function. E.g., SSE strips `<chat_title>...</chat_title>` via `drainTagBuffer` (`stream-publisher.ts:64`), and the final-output write strips via `stripChatTitle(result.output)` — but a new intermediate-text persistence branch that writes `block.text` raw leaks the literal tag into the DB and renders inside the assistant bubble on refresh. Walk every write-site and confirm the same scrub runs (PR #997).
+- **Append-then-write retry safety**: When a job appends an event (`appendEvent(...)`) and then writes a downstream row (`withScopedDb(...)`), ask: if the downstream write throws, does SQS retry the whole job? If yes, the `appendEvent` has already run → the next attempt creates a duplicate event. Required mitigation: wrap the downstream write with `.catch((err) => log.warn({ err }, '...'))` so it's idempotent across retries, OR move the append AFTER the write (subject to the inverse risk: write succeeds but event missing). Default is the catch-and-log pattern, matching `persistContentBlock` / `deps.onMessage` (PR #992).
+- **Dedup with `.at(-1)` only matches the last buffered item**: When a final-output write is deduped against a buffered list via `bufferedEvents.at(-1)`, an SDK final output that matches an EARLIER buffered event still produces a duplicate write. If the assumption is "last buffered item is the final output", document it inline with a comment naming the SDK guarantee. Otherwise widen the dedup to `bufferedEvents.some(...)` or normalize via a content hash (PR #997).
+
+### Cross-Layer & Multi-Context Consistency
+
+- **Fallback chain alignment**: When the same value is resolved in multiple layers, verify all layers use the same fallback chain in the same order.
+- **Dead fallbacks / phantom data dependencies**: If code adds a fallback to a field, verify something in the system actually writes that field. A fallback to unwritten data is dead code.
+- **Planning doc alignment**: When a PR adds new patterns, check whether existing planning docs describe a different target direction. Flag contradictions as blocking.
+
+### Planning Doc Consistency (blocking)
+
+- **Cross-doc conflicts**: When a PR changes behavior documented in another planning doc, that doc must be updated in the same PR. E.g., if `composio-multitenancy.md` says "no migration needed" but the PR introduces a migration, the planning doc must be updated. Flag as blocking.
+- **Superseded sections**: When a PR replaces a mechanism described in a planning doc (e.g., removing `webhookAuth` plugin), add a superseded callout in the old doc pointing to the new one.
+- **Executable rollout ordering**: Deployment steps labeled "MANDATORY order" must be actually executable in that order. A "Pre-deploy sanity check" listed after deploy steps is self-contradictory.
+- **Idempotency semantics**: Upsert/reconcile sections should spell out when a write is a no-op vs update. Without this, implementers may write "select → always update" causing unnecessary DB churn.
 
 ### Error Handling (beyond AGENTS.md basics)
 
-- **Never silently swallow errors**: `catch {}` or `catch { setError(true) }` with no logging is forbidden. At minimum use `console.error`. AGENTS.md: "Do NOT silently swallow (`catch {}`)."
-- **Scope catch blocks narrowly**: If a function does fetch + parse, only catch the parse — let transport/API errors propagate to React Query's `onError` or the global error handler. Don't turn a 403/404 into a misleading "parse error."
-- **Don't conflate API errors with empty data**: Mapping `404 → []` conflates "resource not found" with "resource exists but has no data". If the API already returns `200 { items: [] }` for legitimate empty results, let 404 propagate as an error so the UI can distinguish failure from emptiness.
+- **Never silently swallow errors**: `catch {}` or `catch { setError(true) }` with no logging is forbidden.
+- **Scope catch blocks narrowly**: Only catch the specific error you can handle. A bare `catch` on `connectedAccounts.get()` that converts 429/500/network errors to `NotFoundError` masks transient failures and weakens security gates.
+- **Don't conflate API errors with empty data**: Mapping `404 → []` conflates "not found" with "empty". Let 404 propagate as an error.
+- **Abort/cancel detection must use error shape, not signal state**: When swallowing fetch abort errors under the AGENTS.md "expected errors" exception, discriminate via `err instanceof DOMException && err.name === 'AbortError'` — the spec-compliant shape thrown by both browsers and Node undici. Flag any catch block that uses `request.signal.aborted`, `controller.signal.aborted`, or similar global signal state as the discriminator: those return `true` for any error that lands after abort, silently hiding genuine upstream failures (DNS / ECONNREFUSED / TLS) when they coincide with a client disconnect. For route handlers, the swallow path should return `499` (Nginx convention, non-error in Datadog / Sentry dashboards), not `200` or `500`.
+- **Pushback on "add `console.warn` for visibility" in expected-error catches**: When a reviewer requests a log on a branch that legitimately swallows expected noise (abort, 404→null, parse-or-fallback), check AGENTS.md before agreeing. AGENTS.md says: "Do NOT log-and-rethrow — the boundary already logs." The entire point of swallowing is reducing noise; adding a warn subverts that. Legitimate escape hatches: LB access logs (they already record 499 / status codes), dedicated metrics counters, or structured-event trace attributes — not a free-text `console.warn` that pollutes CloudWatch.
 
 ### Frontend Rules (from AGENTS.md + planning/frontend-architecture.md)
 - **DS compliance**: All standard UI elements MUST use `@aetheronhq/ui` components — not raw DaisyUI HTML classes
@@ -100,73 +219,124 @@ Check against all rules read from AGENTS.md. Common violations to watch for:
 - `DashboardPage` for list pages, `FormPage` for create/edit pages
 - All text via `next-intl` (no hardcoded strings)
 - DRY: no duplicated components across files
+- **Server Component callback prop antipattern**: When a child is a Server Component, it should resolve `t` / `formatDate` / `format` itself via `getTranslations()` / `getFormatter()` from `next-intl/server`. Threading these through props as callbacks forces a Client Component ancestor and adds bespoke prop types for no benefit. Flag any `t: (key: string) => string` or `formatDate: (d: Date) => string` prop on a Server Component (PR #869).
+- **Mixed `<label>` and DS `FormField` in the same form**: Forms must use one wrapper consistently. A composite input (chip list + button + inline input) wrapped in raw `<label htmlFor='...' className='text-field-name ...'>` while sibling rows use `FormField` will drift on every DS token bump. Flag for migration to `<FormField label hint>...</FormField>` (PR #869).
+- **Clearable selects shipping `''` to required fields**: DS `SelectField` with a clear affordance returns `''` when cleared. For fields where `''` is invalid (IANA timezone, ISO currency / country, enum), `field.handleChange(v ?? '')` ships invalid empty strings to the API. Recommend `if (v) field.handleChange(v)` plus a non-empty validator (PR #869).
+- **Default-prop-cascade footgun in shared layouts**: When a shared layout (e.g. `AppLayout`) receives a feature-flag-fed prop with a permissive default (`vapiVoiceId = ''`), audit every parent mount site. Sub-routes that don't pass the prop silently lands in the fallback branch. Recommend either making the prop required (TS surfaces the gap) or passing the real default at every mount (PR #1072).
+- **Cross-component consistency sweep**: When a fix renders a human-readable label in component A, search the codebase for sibling components rendering the same data shape (e.g. raw `voiceId`, raw `userId`, `font-mono` spans of opaque ids). Reviewers will flag a sibling component still showing the raw value as "same symptom one component over" (PR #1072).
+- **Layout pattern consistency between paired containers**: Pages with paired states (loading / error / empty / content) must use the same className shape across all branches. A loading `<div className='flex flex-1 min-h-0'>` paired with an error `<div className='flex-1 min-h-0'>` (missing `flex`) creates a visual jolt during state transitions and surfaces immediately on the support banner / sticky header edge case (PR #990).
+- **`Intl.DateTimeFormat(undefined, ...)` causes SSR/client locale drift**: `toLocaleTimeString(undefined, ...)` and `new Intl.DateTimeFormat(undefined, ...)` use the runtime default locale — `en-US` on Node, `navigator.language` in the browser. Same call renders different output server-side vs client-side → hydration mismatch. Require explicit locale: `useLocale()` (client) / `getLocale()` (server) / `next-intl`'s `useFormatter()` / `getFormatter()` (PR #869).
+- **`createdAt` vs `updatedAt` fallback for "last modified" displays**: New rows have `createdAt` populated but `updatedAt` is often `NULL` until the first edit. A `formatDate(updatedAt)` footer renders blank / "Invalid Date" for fresh entities. Verify the migration sets `updatedAt = createdAt` on insert via trigger, otherwise require fallback `updatedAt ?? createdAt` (PR #869).
+- **Client `maxLength` mirroring backend caps**: When the API caps a string field at N chars (e.g. `reportInstructions` 4000, `reportPrompt` 16000), the textarea must set `maxLength={N}`. Without it, the user types the whole essay before learning from a backend 400. Cross-check the backend schema constants (PR #869).
+- **Form values + `useState` duplicate state**: Don't track the same field in both `defaultValues` (form state) AND a separate `useState`. The two diverge the moment one writer skips the other (e.g. `recipients` in `ReportConfigFormValues` AND `useState<string[]>([])`). Recommend picking one (PR #869).
+- **User-visible "wiring" fixes need a render test**: When a fix threads a new prop through a layout / context provider, adds a hook call to a component, or passes a new options-bag key (`{ defaultVoiceId }`), require a component-level render test asserting the user-visible string. Without it, anyone dropping the wiring would ship green (PR #1072).
+
+### Frontend Performance & State
+
+- **Conditional rendering of inactive content**: Tab contents passed as ReactNode props mount and compute even when hidden. Conditionally render only the active tab's children to avoid unnecessary work as data grows.
+- **Suspense boundaries for `useSearchParams()`**: In Next.js App Router, calling `useSearchParams()` outside a `<Suspense>` boundary opts the entire route out of static rendering. Either wrap the component in `<Suspense>` or lift search-params logic into a parent that does.
+- **URL state preservation**: Filter and search state stored in React state is lost on reload and not shareable. Sync `?search=`, `?category=`, `?tab=` into the URL so the page is bookmarkable. Use the same `useSearchParams()` pattern for all.
+- **Cross-filter state orphaning**: When filter options are derived from already-filtered data (e.g., category options from search-filtered items), the selected filter value can orphan when the options recompute without it. Derive filter options from the full unfiltered catalog, or reset the selection when it falls out of options.
 
 ### Frontend Robustness
 
-- **Browser APIs that can reject** (e.g., `navigator.clipboard.writeText`, `Notification.requestPermission`) must have `.catch()` handlers — otherwise you get unhandled promise rejections.
-- **Timer cleanup**: `setTimeout` / `setInterval` in components must be cleared on unmount (return a cleanup function from `useEffect`). Failing to do so triggers React's "state update on unmounted component" warning.
-- **Scroll bounds on dynamic content**: When rendering potentially large content (e.g., `JSON.stringify(data, null, 2)` in `<pre>`, long lists), add `max-h-* overflow-y-auto` to prevent blowing out the page layout.
-- **No semantic assumptions in formatting**: Don't blindly apply a format to all values of a type (e.g., appending `%` to every number). Check the field's semantic meaning or add a format hint.
-- **Unique element IDs**: IDs constructed from data (e.g., `panel-${type}-${size}`) must be guaranteed unique. Prefer using a truly unique field like the object key or database ID.
-- **Consistent data fetching patterns**: If one component uses a server action for S3 presigned URL content (to avoid CORS/LocalStack issues), all similar components must use the same pattern. Don't mix client-side `fetch(presignedUrl)` with server-side `fetchPresignedJson()`.
-- **URL/path management**: Route paths used in `router.replace()` / `router.push()` should derive from `usePathname()`, not be hardcoded strings. Hardcoded paths in multiple places break silently when routes change.
-- **URL state sync**: When resolving/sanitizing a URL query param (e.g., invalid `?tab=` value), update the URL to match the resolved state so the visible UI and the location bar stay in sync. Preserve unrelated search params when updating.
-
-### i18n (enhanced)
-
-Beyond "all text via next-intl":
-- **No string manipulation as i18n substitute**: Don't use `.replace(/_/g, ' ')` + CSS `capitalize` to render enum values when translation keys already exist. This bypasses the i18n system entirely.
-- **Localise all formatted values**: Duration units, number formats, singular/plural forms — if a function accepts label overrides (e.g., `formatDuration(val, { hour: t('...') })`), use them.
-- **ICU plural rules**: Use `{count, plural, one {# item} other {# items}}` for counts. Don't write `"{count} items"` which is grammatically wrong for count=1.
-
-### Schema & API Consistency
-
-- **TypeBox array `maxItems`**: Array schemas in list responses should include `maxItems` to document the actual server-side limit (e.g., `{ maxItems: 200 }` to match `MAX_WEBHOOK_LOGS`).
-- **Presigned URL responses**: Include `expiresAt` so clients know when to refresh. Be consistent with existing presigned URL patterns in the codebase.
-- **Schema location**: TypeBox schemas should be defined at module level, not inside plugin/handler functions. Follow the existing pattern in the same file.
-- **Parameter naming**: Function parameter names must match what they semantically represent. Don't pass `interaction.providerId` as a parameter named `callId`.
-- **Response envelope consistency**: List endpoints use `{ items: [...] }` or `{ data: [...] }` per project convention. Don't invent custom wrappers like `{ logs: [...] }`.
-
-### Testing
-
-- **New endpoints need integration tests**: Every new API endpoint must have tests covering: happy path, empty result, 404 (not found), 403 (role guard / non-admin), and tenancy isolation (cross-tenant 404).
-- **Don't remove edge-case tests during refactoring**: If the service still handles a case (e.g., empty/null input returning `[]`), the test protecting that behavior must remain.
-- **E2E selector robustness**: DaisyUI components often use hidden inputs (e.g., radio tabs). Playwright `click()` times out on zero-dimension elements. Target the visible `<label>`, not the hidden `<input>`. After removing/renaming headings or text, update all E2E assertions that reference them.
+- **Browser APIs that can reject** (e.g., `navigator.clipboard.writeText`, `Notification.requestPermission`) must have `.catch()` handlers.
+- **Scroll bounds on dynamic content**: Large content needs `max-h-* overflow-y-auto`.
+- **No semantic assumptions in formatting**: Don't blindly apply a format to all values of a type.
+- **Unique element IDs**: IDs constructed from data must be guaranteed unique.
+- **Consistent data fetching patterns**: Don't mix client-side `fetch(presignedUrl)` with server-side `fetchPresignedJson()`.
+- **URL/path management**: Route paths should derive from `usePathname()`, not be hardcoded strings.
+- **URL state sync**: When resolving a URL query param, update the URL to match the resolved state.
 
 ### Information Architecture & UX
 
-- **Don't bury key metrics behind tabs**: When refactoring a page into tabs, audit what was previously visible at a glance. KPIs (scores, status, outcome) that users scan across many items must remain above the tab bar — not hidden behind a click. Moving them into a tab is a workflow regression for power users.
-- **Tabs must justify their existence**: If a tab only contains 2-3 data points that are already shown elsewhere (e.g., a "Cost" tab showing duration + cost already in the header), fold the unique info (e.g., provider) into an existing section as a `<Badge>` and remove the tab. YAGNI — re-add when there's enough content.
-- **Tab naming must match the data**: If the data is webhook payloads, don't call the tab "Logs" (which implies application logs). Use precise names like "Webhooks" or "Webhook Events".
+- **Don't bury key metrics behind tabs**: KPIs that users scan across many items must remain above the tab bar.
+- **Tabs must justify their existence**: If a tab only contains 2-3 data points shown elsewhere, fold into an existing section and remove the tab.
+- **Tab naming must match the data**: "Logs" implies application logs; if the data is webhook payloads, call it "Webhooks".
+- **Search results must retain context**: When grouped views flatten into search results, show category context (chips, badges) so users can orient.
+- **Pagination must be stable**: "Show More" must not reorder or shuffle items already visible. Prefer per-group pagination over global budget.
+
+### i18n (enhanced)
+
+- **No string manipulation as i18n substitute**: Don't use `.replace(/_/g, ' ')` + CSS `capitalize` when translation keys exist.
+- **Localise all formatted values**: Duration units, number formats, singular/plural forms.
+- **ICU plural rules**: Use `{count, plural, one {# item} other {# items}}` for counts.
+- **Dead locale keys**: Every key in the translation file must have a call site. Keys added without references are dead code per AGENTS.md.
+- **Duplicate JSON keys**: Two objects with the same key in a JSON locale file silently overwrite — the second wins. Check for duplicate top-level keys.
+
+### Schema & API Consistency
+
+- **TypeBox array `maxItems`**: Array schemas in list responses should include `maxItems` to document the actual server-side limit.
+- **Presigned URL responses**: Include `expiresAt` so clients know when to refresh.
+- **Schema location**: TypeBox schemas at module level, not inside plugin/handler functions.
+- **Parameter naming**: Function parameter names must match what they semantically represent.
+- **Response envelope consistency**: List endpoints use `{ items: [...] }` or `{ data: [...] }` per convention.
+- **`required` + nullable vs `Optional` for nullable DB columns**: When promoting a nullable DB column to the response schema, default to `required` + `T | null` (e.g. `Type.Union([Type.String(), Type.Null()])` in the response object plus the field name in `required`). Meaning: the key is **always present** in the JSON, the value can be `null`. `Optional(...)` means the key may be **absent entirely**, which breaks client type safety unless they handle `key in obj` checks. Reference: `title`, `sourceKey`, `lastEventAt` in `SessionDto`. Flag any `Optional` on a nullable DB column that has no semantic "key may be absent" justification (PR #992).
+- **`?? null` redundancy**: `kysely-codegen` types nullable columns as `T | null` already, so `row.foo ?? null` in a mapper is dead code — flag for removal to keep the mapper consistent with surrounding nullable fields (PR #992).
+
+### Testing
+
+- **New endpoints need integration tests**: Every new API endpoint must have tests covering: happy path, empty result, 404, 403, and tenancy isolation (cross-tenant 404).
+- **Don't remove edge-case tests during refactoring**: If the service still handles a case, the test protecting it must remain.
+- **E2E selector robustness**: Target visible `<label>`, not hidden `<input>`. After renaming text, update all E2E assertions.
+- **Tests must lock invariants, not just values**: A test named "passes identical timestamps across retries" should actually call the function twice and assert both get the same value — not just assert a single call's output. The test name must match what's actually exercised.
+- **Retry/idempotency regression tests**: When a fix ensures idempotent behavior (e.g., deterministic timestamps for Stripe), add a test that calls the function N times and asserts all invocations produce identical output.
+- **Mock alignment with code changes**: When a route renames `listUserConnections` to `listOrgConnections`, tests mocking the old name silently pass (mock is never called, assertion never fires). Test files not in the PR diff but affected by contract changes must be updated.
+- **Parameterized tests for multiple code paths**: When a set (e.g., `SYNC_WRITE_TOOL_SLUGS`) contains multiple values, at least one test should use each value. A regression that removes a value from the set should fail a test.
+- **Non-exported function testability**: When a private function has non-trivial branching (two-pass parsing, multiple fix rounds during review), consider exporting it for direct testing. Multiple review-round fixes on the same logic are a signal the code is easy to get wrong.
+- **Test name vs assertion mismatch**: Read each test name, then verify the mock data and assertions actually exercise that scenario. A test named "writes when differs" that mocks identical values and asserts dedup is a naming bug — it hides the fact that the "differs" branch has zero coverage. Flag it.
+- **Side-effect coverage on new branch paths**: When a PR adds a new conditional path (dedup, early return, guard), check if tests assert the side effects of that path — not just the primary return value. E.g., a dedup test should assert that metadata (timestamps, counters) is still correctly updated, not just that the duplicate write was skipped.
+- **Mock fidelity**: When production code starts using the return value of a mocked function (e.g., checking `flushed.type` from `appendEvent`), verify the mock returns a shape that includes those fields. A mock returning `{ eventTs, createdAt }` when the code now reads `.type` will silently break the logic.
+- **Route handler catch-branch coverage**: When a route handler adds a `try/catch`, tests must exercise BOTH the catch branch (mock fetch to throw the expected error class — e.g., `new DOMException('aborted', 'AbortError')`) AND the re-throw path (mock fetch to throw a non-matching error, assert `await GET(...)` rejects with the same error). The re-throw test is what catches the race-condition regression: without it, a future refactor that widens the catch discriminator silently restores the original bug. Template: `apps/web/src/app/api/csp-report/route.test.ts`.
+- **Real-DB integration tests for migration-coupled code with branched WHERE**: Per AGENTS.md "never mock the database". When a function has a multi-branch `WHERE` guard (e.g. `setAutoTitle` writes IF `title IS NULL OR title_source = 'auto'` and skips when `title_source = 'manual'`), every branch needs a Testcontainers-backed test in the appropriate package (`packages/sessions`, `apps/api/test/integration/`, etc.). The most critical branch is the safety branch (the one that PROTECTS user data) — regression there silently overwrites and only surfaces in production support tickets. Mocking the DB in `agent-runner.test.ts` doesn't substitute (PR #992).
+- **Upstream-request shape coverage in route-handler tests**: Tests that only assert response status leave the upstream call shape untested. Dropping the `Authorization` header, switching `Accept`, or removing `signal: request.signal` would all keep the suite green. Require: positive `expect.objectContaining({ headers, signal })` and, for conditional spreads (`...(lastEventId ? { 'Last-Event-ID': lastEventId } : {})`), a negative assertion (`expect.not.objectContaining({ 'Last-Event-ID': expect.anything() })`) so a refactor to always-include doesn't silently send `null` upstream (PR #1038).
+- **`vi.unstubAllGlobals()` cleanup**: When a test stubs `global.fetch` (or any other global) via `vi.stubGlobal`, expect an `afterEach(() => vi.unstubAllGlobals())`. Vitest's default `isolate: true` makes omission safe today, but explicit cleanup matches the convention in `proxy.test.ts` and `useChat.test.ts` (PR #1038).
+- **Counter-based alternating mocks are fragile**: A `mutateCallIndex++ % 2`-style mock that alternates between two return values silently breaks the moment the component reorders or adds a third hook call. Recommend matching on argument identity (`vi.fn((action) => action === createX ? mockA : mockB)`) so the test stays correct under reorders (PR #869).
+- **Case-insensitive validation and `MAX_*` cap coverage**: When the implementation does `.toLowerCase()` dedup or enforces a numeric cap, both invariants need explicit tests. The implementation is easy to delete in a refactor and the existing tests would still pass on the happy path. Flag missing coverage even when the code looks correct today (PR #869).
 
 ### Server Actions & Data Fetching
 
-- **Don't use `'use server'` for presigned URL fetches**: S3 presigned URLs carry authentication in the URL itself — they are designed for direct client-side access. Routing every fetch through a Next.js server action (client → server → S3 → server → client) doubles latency for zero security benefit. If CORS in dev (e.g., LocalStack) is the only reason, the workaround must be conditional or documented, not applied to production.
-- **Consistent presigned URL pattern**: Once you decide on direct-client or server-proxy, apply it uniformly. Mixed patterns confuse future developers.
+- **Don't use `'use server'` for presigned URL fetches**: Routing through a server action doubles latency for zero security benefit.
+- **Consistent presigned URL pattern**: Once you decide on direct-client or server-proxy, apply it uniformly.
 
 ### Safety Caps & Defensive Coding
 
-- **Generic utility functions need hard safety caps**: If a reusable function like `listObjects(bucket, prefix, maxKeys?)` paginates S3, add a hard upper bound (e.g., `const HARD_LIMIT = 1000`) inside the function itself. Callers can still pass lower values, but forgetting `maxKeys` won't trigger unbounded pagination.
-- **No `console.error` in production frontend code**: If the error state is already surfaced to the user via `<Alert>` or similar UI, `console.error` is redundant and leaks implementation details in the browser console. Remove it.
+- **Generic utility functions need hard safety caps**: Reusable pagination functions must have internal upper bounds.
+- **No `console.error` in production frontend code**: If the error is surfaced to the user via `<Alert>`, `console.error` is redundant.
 
 ### React Anti-patterns
 
-- **Key collision on data-driven lists**: Using the item value itself as a React key (e.g., `<li key={item}>`) collides when two items are identical (common with LLM-generated content). Always use `key={\`${index}-${item}\`}` or a unique ID.
-- **Config/data constants don't belong in hook files**: Static config mappings (e.g., tool call configs, icon maps) should live in a dedicated `types.ts`, `@/lib/` config file, or co-located with the feature. Hooks are for stateful logic. When hooks import from components, it inverts the dependency direction — move shared config to `@/lib/`.
-- **DRY: extract shared hook patterns early**: When the same stateful pattern (e.g., clipboard logic with copied state + timer + cleanup) appears in 2+ files in the same PR, extract a hook immediately. It's cheapest at PR time; waiting creates tech debt.
-- **Fragile magic strings from LLM output**: Comparing LLM-generated values against exact strings (e.g., `=== 'Unknown'`) is fragile — models may return `'unknown'`, `'N/A'`, `''`, or locale-specific variants. Always normalize with `.trim().toLowerCase()` and check against a set of known null-ish values.
+- **Key collision on data-driven lists**: Use `key={\`${index}-${item}\`}` or a unique ID, not the item value itself.
+- **Config/data constants don't belong in hook files**: Move shared config to `@/lib/`.
+- **DRY: extract shared hook patterns early**: Same stateful pattern in 2+ files → extract a hook.
+- **Fragile magic strings from LLM output**: Normalize with `.trim().toLowerCase()` and check against a set of known null-ish values.
+- **Hydration regression tests**: When fixing a React hydration/persistence effect, tests should cover both the user-visible persistence outcome and the scheduling contract. Add a test with unstable callback identities across rerenders when the bug came from callback deps, and a namespace/context-switch test when readiness gates can strand writes.
+
+### Edge Cases & Robustness
+
+For each significant code path introduced or modified, systematically check:
+- **Empty/null inputs**: What happens when an array is empty, a string is `''`, a field is `undefined`? E.g., `toolCalls?.find(...)` when `toolCalls` is `[]` returns `undefined` — does the caller handle that?
+- **Boundary conditions**: Zero items, single item, maximum items. E.g., `connectedAccounts.list` returning exactly one page vs multiple pages vs zero results.
+- **Duplicate/repeated values**: Two tool calls with the same function name, two items with the same key, duplicate JSON keys in locale files.
+- **Truthiness vs type-check mismatches**: `if (m.result)` drops valid empty strings `""`. Use `typeof m.result === 'string'` when the empty value is meaningful.
+- **Mixed-case / normalization**: External APIs returning `"active"` while internal code expects `"ACTIVE"`. Acronyms in title-case utils (`ML` → `Ml`).
+- **Stale/orphaned references**: Mocks that reference renamed functions, UI elements referencing deleted translation keys, test assertions referencing removed headings.
+- **Whitespace-only content blocks**: A guard like `text.length > 0` admits `"\n"`, `"  "`, `"\n\n"`. Claude routinely emits whitespace-only text blocks between consecutive `tool_use` calls on cached / cold turns; persisting them produces empty bubbles between tool-call rows on refresh (live merges them via `appendToBlock` so it's invisible during streaming). Prefer `text.trim().length > 0`, or — if a downstream scrub function (e.g. `stripChatTitle`) already trims — verify the guard is consistent on both sides of any dedup comparison (PR #997).
+- **`??` failing on empty strings**: When a default-value chain (`flag ?? defaultFlag`) reads from a feature-flag SDK or API that returns `string` (not `string | null`), `??` lets `''` through. Trace the read site: if the source returns the raw string verbatim (e.g. `@aetheron/feature-flags` `str()`), recommend `||` or normalize blanks at the boundary (PR #1072).
 
 ### Accessibility
 
-- **Hover-only controls need keyboard support**: Icon-only buttons visible only on `group-hover` are invisible to keyboard and screen-reader users. Always add `aria-label` for screen readers and `focus-visible:opacity-100` alongside `group-hover:opacity-100` to reveal the control on keyboard focus.
+- **Hover-only controls need keyboard support**: Add `aria-label` and `focus-visible:opacity-100` alongside `group-hover:opacity-100`.
 
 ### General Quality
-- Redundant / dead code
+- Redundant / dead code (including dead fields in types that are computed but never read)
 - Inconsistencies within the PR itself (e.g., using DS `Loading` in one file but raw DaisyUI in another)
 - Breaking changes without backward compatibility strategy
 - Missing tests for new functionality
+- PR description drift — when implementation changes during review, the PR description must be updated to match the final state
+- **Out-of-scope changes**: Flag any file changes unrelated to the PR's stated purpose. Unrelated test refactors, reverted commits from other PRs, or drive-by formatting changes should be in a separate PR. They add review burden and can introduce flaky behavior (e.g., replacing `vi.waitFor` with `setTimeout(0)` in a PR about message persistence).
 
-## Step 3: Deduplicate
+## Step 3: Deduplicate & Evaluate Pushback
 
 Cross-reference findings against existing GitHub comments:
 
@@ -179,6 +349,14 @@ For each issue found:
   → If genuinely new: add to comment list
 ```
 
+**Evaluate author pushback on existing comments for logical soundness:**
+- **Valid pushback**: "Merging these two guards loses diagnostic signal — they represent two different upstream issues" (legitimate: separate log lines for separate root causes).
+- **Valid pushback**: "This is a private function; exporting it just for testing changes the module boundary" (debatable but reasoned).
+- **Weak pushback**: "This is a follow-up" when the fix is cheap and the bug is real in the current PR (AGENTS.md: "If it needs doing, do it now").
+- **Weak pushback**: "Not a real issue — X is always Y" without citing the type definition or SDK source (violates evidence-based principle).
+
+When the author pushes back and cites evidence (SDK types, actual runtime behavior), accept the pushback. When the author pushes back with speculation, ask for the evidence.
+
 Present a summary table to the user:
 
 | Issue | Already Covered By | Action |
@@ -188,6 +366,10 @@ Present a summary table to the user:
 
 ## Step 4: Draft Comments
 
+Split findings into two streams:
+- **Inline comments** — real issues only (P1 / P2 / P3). One comment per concern, anchored to the exact line.
+- **Review body** — high-level summary + a consolidated `## Verified` block listing patterns that were checked and found correct.
+
 For each new issue, draft an inline comment following these principles:
 
 ### Tone
@@ -195,18 +377,41 @@ For each new issue, draft an inline comment following these principles:
 - Frame as observations/suggestions, not demands
 - Use "worth considering" / "for consistency" / "not blocking" for minor items
 - Include the **rule reference** (e.g., "Per `frontend-architecture.md` §4")
+- Include the **evidence** (e.g., "Checked `ScopedDb.selectFrom` at L109 — it already applies the filter")
+- For external API constraints, **cite the docs URL**
 - Offer escape hatch: "happy to address in a follow-up if preferred"
 
 ### Format
-- **Bold tag** at the start: `**DS component consistency**`, `**DRY**`, `**Inconsistency**`, `**Architecture**`
+- **Bold tag** at the start: `**DS component consistency**`, `**DRY**`, `**Race condition**`, `**Behavioral change**`, `**Operational impact**`, `**Data consistency**`
 - Keep to 2-5 sentences
 - Include a brief code suggestion when helpful
 - No emoji unless the project convention uses them
 
-### Severity Tags (optional, if the team uses them)
-- P1: Must fix before merge
-- P2: Should fix, may defer with justification
-- P3: Suggestion / nice-to-have
+### Inline vs. Review-Body Placement
+
+**Only post inline comments for actual issues** — anything tagged P1 / P2 / P3, or any concern that needs the author to act on a specific line. Inline noise erodes review signal; an inline comment is a finger pointing at a problem, not a checkmark.
+
+**Consolidate all positive verifications into the review body**, not inline. Verifications prove the review was thorough but don't require author action, so they belong in a single "Verified" block at the end of the review body where they can be skimmed in one pass. Posting `**VERIFIED**` comments inline floods the file diff with green-light noise that makes the real issues harder to spot.
+
+### Positive Verifications (in review body, not inline)
+For important patterns (security, tenancy, concurrency, doc-vs-code claims) that are **correctly implemented**, add a `## Verified` (or `## What's correct`) section to the review body that lists each verified claim with the code reference. Example block to include in the review body:
+
+```
+## Verified
+
+- **Security** — org-scoped IDOR protection holds: `ScopedDb` applies orgId filter at `repo.ts:109`, delete checks ownership at `service.ts:142`.
+- **Tenancy chain** — layered ownership: route auth → service org check → repo scoped query. All three gates present.
+- **Best practice** — UUIDv7 generation is application-side, no DEFAULT in migration.
+- **Concurrency** — `SELECT FOR UPDATE` prevents race between status check and update at `service.ts:88`.
+- **Doc-vs-code** — STATUS_RANK values match `routes/webhooks/foo.ts:47` exactly; retry timing matches `handler.ts:614+`; etc.
+```
+
+This keeps the file diff focused on actionable comments while still demonstrating breadth of review.
+
+### Severity Tags
+- P1: Must fix before merge (bugs, security, data loss)
+- P2: Should fix, may defer with justification (correctness, consistency)
+- P3: Suggestion / nice-to-have (DRY, naming, follow-up improvements)
 
 ## Step 5: Post to GitHub
 
@@ -244,9 +449,27 @@ gh api repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/events \
 
 **Line numbers**: Use the actual file line number (not diff line), with `"side": "RIGHT"` for additions.
 
-**Review body**: Keep it neutral, no personal signatures. Example:
-> ## [Topic] Review
-> A few observations around [area]. Most are minor but worth aligning before merge.
+**Review body**: Keep it neutral, no personal signatures. Structure:
+
+```
+## [Topic] Review
+
+[1-3 sentence summary of what was checked and the overall verdict.]
+
+## Issues
+
+[Optional brief list pointing at the inline comments — or skip if the inline tags speak for themselves.]
+
+## Verified
+
+- **[Category]** — [what was checked] matches [code reference].
+- **[Category]** — [what was checked] matches [code reference].
+- ...
+
+[Optional closing — e.g. "No blockers" / "Two P1s worth fixing before merge".]
+```
+
+The `## Verified` block is where positive verifications live — never inline.
 
 ## Step 6: Verify
 
@@ -262,9 +485,52 @@ gh api repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/comments \
 Before posting, confirm:
 - [ ] AGENTS.md was read and all applicable rules were checked
 - [ ] Relevant planning docs were read based on PR scope
+- [ ] All claims are evidence-based (real code/types verified, not assumed)
+- [ ] External API constraints verified via docs (URLs cited where applicable)
+- [ ] User/operator experience traced for all behavioral changes
+- [ ] Edge cases systematically checked (empty, null, zero, max, duplicates) for each new code path
+- [ ] **Variable value-domain changes traced**: For each variable whose possible values changed (new null path, new conditional, dedup skip), all downstream consumers in the same function/module were checked
+- [ ] **New branch paths checked for side-effect gaps**: Every new if/else, dedup, or early return was traced for bypassed side effects (metadata, timestamps, counters)
+- [ ] **React hydration/persistence effects checked**: Effect deps are true trigger values, self-canceling state writes are not deps, PENDING paths reach READY, and cancelled loads cannot strand `hydrating`
+- [ ] **Catch-block discriminators use error shape, not global state**: Fetch abort catches discriminate via `err instanceof DOMException && err.name === 'AbortError'`, not `signal.aborted`. Route handler try/catch has tests covering BOTH the catch branch AND the re-throw path.
+- [ ] **Test names match assertions**: Each new test's name accurately describes what the mock data + assertions actually verify
+- [ ] **No out-of-scope changes**: All modified files relate to the PR's stated purpose
+- [ ] **Specialized helper preference checked**: `withSystemDb` callers audited for whether `withBootstrapSystemDb` (or other more specific helper) applies
+- [ ] **Append-then-write retry safety verified**: Jobs that `appendEvent` then `withScopedDb` have idempotent guards (`.catch(log.warn)`) to survive SQS retries
+- [ ] **Buffer-then-flush patterns flagged for centralization or AC tightening** when the planning doc mandates centralized SDK fan-out
+- [ ] **Output marker stripping consistent across SSE / persistence paths**
+- [ ] **`logger.warn` reviewed against Sentry threshold** — user-visible content failures use `logger.error` or explicit `Sentry.captureException`
+- [ ] **Real-DB integration tests** present for migration-coupled functions with branched WHERE guards (especially the safety branch)
+- [ ] **OpenAPI nullable columns use `required` + `T | null`**, not `Optional`, unless absence is semantically distinct from null
+- [ ] **`?? null` redundancy removed** on `kysely-codegen` `T | null` fields
+- [ ] **Server Components don't accept `t` / `formatDate` / `format` callbacks as props** — they call `getTranslations()` / `getFormatter()` directly
+- [ ] **Paired containers (loading / error / empty / content) share identical className shape**
+- [ ] **`Intl.DateTimeFormat` calls receive an explicit locale**, never `undefined`
+- [ ] **Sentry `beforeSend` filter audited** for tag-aware bypass coverage on all explicit captures and replay-coupling documentation
+- [ ] No manufactured issues — every inline comment addresses a real concern (P1/P2/P3)
+- [ ] **Inline comments are issues only** — no `**VERIFIED**` / `**SECURITY VERIFIED**` etc. inline. Positive verifications go in the review body's `## Verified` block.
+- [ ] Verified-safe patterns recorded in the review body's `## Verified` block with code references
 - [ ] All findings cross-checked against existing reviewer comments
 - [ ] No duplicates with other reviewers
+- [ ] Author pushback on existing comments evaluated for logical soundness
 - [ ] Comments reference specific rules/docs (e.g., "Per AGENTS.md", "Per frontend-architecture.md §4")
+- [ ] **SDK parameters verified against actual Zod schema** in `node_modules` — not assumed from docs or parameter names
+- [ ] **JSONB column handling verified**: code processing JSONB values handles both object (DB read) and string (`JSON.stringify`) inputs
 - [ ] Tone is constructive, not prescriptive
 - [ ] Review body has no unintended signatures or names
 - [ ] Line numbers are correct (file lines, not diff lines)
+
+## Provenance
+
+- Base checklist and foundational principles established from PR review cycles across the codebase.
+- External API integration, security, operational readiness, and cross-service consistency sections built from patterns observed across PRs #867–#997.
+- SDK schema verification and JSONB type awareness rules added after PR #919 (`feat/composio-org-level-sync`), where `orderDirection` was silently stripped by Composio SDK's Zod safeParse, and `mergeMetadataJson` failed on JSONB objects because `typeof existing !== 'string'` skipped the merge for DB-sourced metadata (Apr 2026).
+- Framework-level race prevention check added after PR #1017 (`fix/integrations-search-lag`) (Apr 2026).
+- React hydration / persistence scheduling checks added after PR #1044 (`fix/agent-config-render-loop`), where unstable chat callback identity caused repeated hydration/SSE reconnects, `sessionId` self-cancelled cleanup, and namespace readiness / hydrating early-return gaps needed review fixes (May 2026).
+- Global-state vs error-shape discriminator rule (Concurrency), abort/cancel error-shape rule + `console.warn`-on-expected-errors pushback (Error Handling), and route-handler catch-branch test coverage added after PR #1038 (`fix/connect-web-27-session-stream-abort`). First pass used `request.signal.aborted` to detect client disconnects in an SSE proxy route; reviewer caught that the discriminator would silently 499 genuine upstream failures (ECONNREFUSED / DNS / TLS) that coincided with the disconnect. Fix switched to error-shape detection matching the codebase's existing `useChat.ts` / `query-retry.ts` pattern and added `route.test.ts` with abort→499, non-abort→rethrow, happy-path, and guard coverage (May 2026).
+- Inline-vs-review-body placement rule (Step 4 / Step 5) added after PR #1040 (`docs(V2-273): tighten SMS planning doc`) review pass posted 5 inline `**VERIFIED**` comments alongside 3 issue comments. User feedback: positive verifications inline drown the real issues — consolidate them into a single `## Verified` block in the review body so the inline diff stays signal-only (May 2026).
+- Specialized helper preference (Architecture & Code Rules) added after PR #1059 (`fix/structured-output-bootstrap-rls`), where the bootstrap path manually constructed a `SystemDbContext` and called `withSystemDb` instead of using the dedicated `withBootstrapSystemDb(reason, fn)` helper that exists for exactly this case (May 2026).
+- Buffer-then-flush vs centralized fan-out, output-marker scrub consistency, append-then-write retry safety, `.at(-1)` dedup, whitespace-only content blocks, real-DB tests for branched WHERE, `logger.warn`-to-Sentry threshold, structured logger error payloads, `required` + nullable vs `Optional`, `?? null` redundancy added after PR #997 (`V2-380/fix-intermediate-messages`) and PR #992 (`V2-382/chat-session-title-persistence`). Both PRs landed multi-round reviewer fixes around mid-run vs post-run persistence, dedup edge cases, retry idempotency, and OpenAPI contract shape (Apr–May 2026).
+- Frontend Rules expansion (Server Component callback prop antipattern, mixed `<label>` / `FormField`, clearable selects shipping `''`, default-prop-cascade footgun, cross-component consistency sweep, paired-container className shape, `Intl.DateTimeFormat(undefined)` SSR drift, `createdAt`/`updatedAt` fallback, client `maxLength` mirroring backend caps, form-values + `useState` duplicate state, render tests for wiring fixes) added after PR #869 (`V2-329/report-config-form`), PR #990 (`V2-376/agent-config-support-banner-cutoff`), and PR #1072 (`fix/voice-label-default-voice`) — recurring single-line wiring/consistency reviewer feedback (Apr–May 2026).
+- Test-coverage expansion (upstream-request shape with negative `expect.not.objectContaining`, `vi.unstubAllGlobals()` cleanup, counter-based mock fragility, case-insensitive validation + `MAX_*` cap coverage) added after PR #1038 (`fix/connect-web-27-session-stream-abort`) and PR #869. The shape-locking rule is what catches refactors that drop `Authorization` / `Last-Event-ID` / `signal` from upstream calls without failing the suite (May 2026).
+- Sentry & Replay Configuration section added after PR #1039 (`fix/sentry-ignore-fetch-network-failure`) — `ignoreErrors` was filtering both replay buffers and tagged diagnostic captures. Switched to `beforeSend` with 1% canary sampling + tag-aware bypass; review checklist now requires auditing all `Sentry.captureException` sites for the bypass tag, documenting replay coupling, and using engine-agnostic constant names. Detailed patterns live in the dedicated `sentry-observability` skill (May 2026).

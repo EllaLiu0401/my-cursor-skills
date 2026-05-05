@@ -58,7 +58,62 @@ export async function up(db: Kysely<unknown>): Promise<void> {
 // ADD VALUE is not reversible in Postgres — down is a no-op or recreate
 ```
 
+## JSONB Column Handling
+
+When reading JSONB columns via Kysely, the value is a **parsed JavaScript object** (or `null`), NOT a string. `kysely-codegen` types these as `Json | null` where `Json = JsonValue = JsonArray | JsonObject | JsonPrimitive`.
+
+### Common pitfall: `typeof` guards on JSONB data
+
+```typescript
+// BAD — typeof is always 'object' for non-null JSONB, this guard skips the merge
+function mergeMetadata(existing: unknown, incoming: string | null): string | null {
+  if (!existing || typeof existing !== 'string') return incoming; // ← bug: DB objects skip merge
+  return JSON.stringify({ ...JSON.parse(existing), ...JSON.parse(incoming!) });
+}
+
+// GOOD — handle both string (from JSON.stringify) and object (from DB) inputs
+function mergeMetadata(existing: unknown, incoming: string | null): string | null {
+  if (!existing) return incoming;
+  if (!incoming) return typeof existing === 'string' ? existing : JSON.stringify(existing);
+  try {
+    const base: unknown = typeof existing === 'string' ? JSON.parse(existing) : existing;
+    const overlay: unknown = JSON.parse(incoming);
+    if (typeof base === 'object' && base !== null && typeof overlay === 'object' && overlay !== null) {
+      return JSON.stringify({ ...base, ...overlay });
+    }
+    return incoming;
+  } catch {
+    return incoming;
+  }
+}
+```
+
+### No `as` type assertions
+
+This codebase uses `@typescript-eslint/consistent-type-assertions: never`. Use runtime type narrowing instead:
+
+```typescript
+// BAD — ESLint rejects `as`
+const obj = JSON.parse(str) as Record<string, unknown>;
+
+// GOOD — runtime narrowing
+const parsed: unknown = JSON.parse(str);
+if (typeof parsed === 'object' && parsed !== null) {
+  // TypeScript narrows to `object`, spread is valid
+  return JSON.stringify({ ...parsed, ...overlay });
+}
+```
+
+### Tombstone resurrection must merge metadata
+
+When resurrecting a soft-deleted row, always **merge** metadata (spread existing + incoming), never overwrite. Critical fields like `slackAppId` in metadata are needed for cleanup flows. Overwriting creates unrecoverable orphans.
+
 ## Key References
 
 - `planning/db-conventions.md` — full DB conventions (source of truth)
 - `AGENTS.md` — always-applied rules including DB & Multi-Tenancy section
+
+## Provenance
+
+- PG ENUM rules derived from `AGENTS.md` and `planning/db-conventions.md`.
+- JSONB handling, `as`-assertion ban, and metadata merge rules added after PR #919 (`feat/composio-org-level-sync`), where `typeof existing !== 'string'` silently skipped metadata merge for Kysely-sourced JSONB objects, losing `slackAppId` during tombstone resurrection (Apr 2026).

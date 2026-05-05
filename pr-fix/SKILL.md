@@ -73,9 +73,24 @@ For every human reviewer comment, determine:
 - [ ] If moving code between files, does the function signature stay identical? (no TS breakage)
 - [ ] If changing UI layout, do E2E tests reference moved/removed elements?
 - [ ] If an AI judge flags a CRITICAL/WARNING, verify by reading the actual code — AI reviewers often misread cross-file relationships.
+- [ ] **Framework-level protection**: When a reviewer flags a timing / race condition, verify whether the framework prevents it at a lower level before implementing a defensive fix. Read the actual framework source code — official docs often don't cover internal mechanisms. E.g., Next.js `router.replace` uses an action queue that discards superseded navigations (`app-router-instance.js` `dispatchAction`), preventing `searchParams` from showing intermediate values during fast typing. A `lastSyncedRef` for this scenario would be YAGNI.
 - [ ] **Cross-layer consistency**: If the same value (brand, locale, config) is resolved in multiple layers (JS, templates, Terraform, subject lines), verify all layers use the same fallback chain. Fixing one layer without fixing others creates divergence.
 - [ ] **Dead fallbacks**: If a fallback references a field (e.g., `user.app_metadata.brand`), verify something actually writes that field. Don't add fallbacks to phantom data.
 - [ ] **Planning doc alignment**: Check if the fix contradicts the target direction in `planning/*.md`. If so, either align with the plan or update the planning doc.
+- [ ] **Second-order side effects**: If the fix changes a variable's value domain (e.g., from "always non-null" to "possibly null"), search for all downstream consumers of that variable in the same function/module. Code you didn't touch can break if it had an implicit assumption about the old value domain.
+- [ ] **Dedup / control-flow skip**: If the fix adds a conditional skip (dedup, early return, guard clause), trace what code is now bypassed and check if any side effects in the skipped path are still needed (e.g., metadata updates, timestamps, counters).
+- [ ] **SDK parameter existence**: If the fix adds parameters to an SDK call, verify the parameter is in the SDK's validation schema (Zod, io-ts, etc.) — don't trust parameter names or docs alone. Read the actual schema in `node_modules`.
+- [ ] **JSONB type handling**: If the fix processes a JSONB column value (metadata, config, etc.), verify the code handles both `object` (from DB reads) and `string` (from `JSON.stringify`) inputs. `typeof x !== 'string'` is always true for DB-sourced JSONB.
+- [ ] **Metadata merge on resurrection**: If the fix touches tombstone resurrection (soft-delete → restore), verify metadata is merged (spread), not overwritten. Critical fields like `slackAppId` survive only through merge.
+- [ ] **Specialized helper preference**: Before manually constructing a context for `withSystemDb` / `withScopedDb`, grep the file's exports for a more specific helper (`withBootstrapSystemDb`, `withScopedDbForOrg`, etc.) — the parameterized variant usually exists.
+- [ ] **Sentry log-level threshold**: `logger.warn` (level 40) is silently dropped by `sentryLogHook` (threshold >= 50). User-visible content failures need `logger.error` or explicit `Sentry.captureException`.
+- [ ] **Sentry `beforeSend` over `ignoreErrors`**: For new noise filters in `sentry.*.config.ts`, default to `beforeSend` (preserves replays + tagged captures) and read the `sentry-observability` skill.
+- [ ] **Buffer-then-flush vs centralized fan-out**: When a backend fix routes events via an in-memory buffer that drains after the run, check `planning/engine/sessions.md` for the centralization mandate before merging.
+- [ ] **Append-then-write retry safety**: If the fix adds `appendEvent(...) → withScopedDb(...)`, wrap the downstream write with `.catch((err) => log.warn(...))` so SQS retries don't duplicate the appended event.
+- [ ] **Real-DB integration tests for branched WHERE guards**: When the fix adds a function with multi-branch `WHERE` (e.g. `WHERE x IS NULL OR y = 'auto'`), add a Testcontainers test for each branch — especially the safety branch that protects user data.
+- [ ] **OpenAPI `required` + nullable**: For nullable DB columns surfaced in responses, use `required` + `T | null`, not `Optional`. The latter changes client semantics from "value is null" to "key may be absent".
+- [ ] **Server Component callback prop antipattern**: If the fix touches a Server Component that receives `t` / `formatDate` as props, replace the props with `getTranslations()` / `getFormatter()` calls inside the component.
+- [ ] **Paired container className parity**: Loading / error / empty / content containers must share the same className shape — diff them character-by-character.
 
 ## Step 4: Present Summary to User
 
@@ -120,6 +135,12 @@ After user approval, for each fix:
 2. **Check existing patterns** — search the codebase for similar code as reference
 3. **Make the minimal change** — KISS, no scope creep
 4. **Follow AGENTS.md rules** — DRY, no `any`, no `eslint-disable`, etc.
+5. **Verify SDK schemas before adding parameters** — when a reviewer suggests adding SDK parameters (e.g., `orderDirection`), read the SDK's Zod schema in `node_modules/.pnpm/{package}/dist/*.mjs` to confirm the parameter exists. Zod `safeParse` silently strips unknown keys — the parameter compiles fine but is a no-op at runtime.
+6. **JSONB columns return objects, not strings** — Kysely returns JSONB columns as parsed JS objects. Never use `typeof x === 'string'` to guard JSONB data from the DB — it will always be false. Use runtime type narrowing: `typeof x === 'object' && x !== null` for objects, handle both string and object inputs.
+7. **No `as` type assertions** — this codebase uses `@typescript-eslint/consistent-type-assertions: never`. For `JSON.parse` results, use `const x: unknown = JSON.parse(...)` + runtime type narrowing (`typeof x === 'object' && x !== null` → spread is valid on narrowed `object` type). Never use `as Record<string, unknown>` or similar.
+8. **Specialized helper check** — when a fix touches a helper family (`with-system-db.ts`, `with-scoped-db.ts`, `withTenancyContext`, etc.), grep the file's exports and pick the most specific helper. A bootstrap path manually constructing a `SystemDbContext` and calling `withSystemDb(ctx, fn)` should be `withBootstrapSystemDb(reason, fn)` — the parameterized helper exists for exactly this case (PR #1059).
+9. **Sentry log-level threshold** — when reviewer feedback says "log this failure" or "this should reach Sentry", confirm the target level. `logger.warn` is level 40 and is silently dropped by `packages/sentry/src/log-hook.ts:27` (threshold >= 50). For user-visible content failures, fix to `logger.error` so the hook captures, or call `Sentry.captureException` explicitly (PR #997). Add structured payload context (`blockType`, `eventType`, etc.) so the Sentry issue can be bisected (see the dedicated `sentry-observability` skill for full Sentry / replay / canary-sampling patterns).
+10. **`beforeSend` over `ignoreErrors` for noise filters** — when a fix adds Sentry filtering for transient errors (`Failed to fetch`, etc.), prefer `beforeSend` with canary sampling + tag-aware bypass over `ignoreErrors`. `ignoreErrors` runs before replay attachment (drops the on-error replay) and matches on message only (drops tagged diagnostic captures). Read the `sentry-observability` skill before editing `sentry.*.config.ts` (PR #1039).
 
 ### Test coverage (always add when flagged)
 
@@ -137,6 +158,8 @@ Determine the right test type based on what changed:
 1. Read `planning/testing.md` for conventions
 2. Find an existing test file of the same type as reference
 3. Follow the exact same patterns (imports, describe structure, fixtures)
+4. **Test side effects, not just primary behavior**: For each new branch path (if/else, dedup skip, early return), ask "what side effects does this path have?" and assert them. E.g., if a dedup path skips a write, verify that dependent metadata (timestamps, counters) is still updated from an alternative source.
+5. **Test name must match assertion**: Read the test name aloud, then check if the mock data and assertions actually verify that exact scenario. A test named "writes when differs" that actually tests the "match" path is a coverage gap in disguise.
 
 ## Step 6: Verify No Breakage
 
@@ -206,6 +229,32 @@ Good catch — {brief acknowledgment}.
 {Optional: brief explanation of the design decision}
 ```
 
+### Reply template — pushback with reasoning
+
+When declining a suggestion, cite the rule, the reference pattern, and the concrete tradeoff. Don't just say "no" — explain why the suggestion subverts a higher principle.
+
+```
+Acknowledged — {summary of suggestion}.
+
+{Why the suggestion conflicts with X}: {concrete trace of the cost}.
+
+Reference: {AGENTS.md §section / planning/foo.md / existing pattern at file:line}.
+
+Happy to add it back if you'd prefer, but the {KISS / consistency / observability} cost felt too high.
+```
+
+**Worked example (PR #1038 — declining `console.warn` on the 499 branch):**
+
+> Skipped the `console.warn` though — with the tighter check, the 499 branch is by definition expected client churn (per agents.md "swallowing expected errors" exception). LB access logs already surface the 499 count if we ever need to spot abnormal disconnect spikes, and adding warn-level noise to CloudWatch on every tab close felt against the KISS spirit. Happy to add it back if you'd prefer.
+
+**Worked example (PR #997 — addressing logger threshold + accepting an "investigate" comment):**
+
+> Investigated — this is actually a non-issue. `stripChatTitle` already returns a trimmed string (implementation: `return text.replaceAll(CHAT_TITLE_RE_GLOBAL, '').trim()`), so `text` in `persistContentBlock` is already trimmed before `onMessage`. Both sides of the dedup go through `stripChatTitle` (which includes `.trim()`), so whitespace differences cannot cause a mismatch.
+>
+> Simplified the redundant `text.trim().length > 0` to `text.length > 0` in cebd2dd for clarity.
+
+The reply pattern: state the investigation, cite the implementation, name the code change (or non-change). Reviewers trust this far more than a bare "fixed" or "skipped".
+
 ## Key Principles
 
 - **Always ask before changing code** — present analysis first, wait for approval
@@ -214,7 +263,19 @@ Good catch — {brief acknowledgment}.
 - **Check references** — search codebase for existing patterns before inventing new ones
 - **Don't break things** — run typecheck + lint after every change
 - **Follow AGENTS.md** — it prevails over all other docs
-- **Minimal scope** — only fix what the reviewer asked about, nothing more
+- **Minimal scope** — only fix what the reviewer asked about, nothing more. Never include unrelated changes (e.g., reverting a commit from another PR) — they attract extra review scrutiny and can introduce flaky tests.
 - **Verify rule scope** — backend rules don't apply to frontend files and vice versa
+- **Trace the full variable lifecycle** — when a fix changes a variable's possible values, grep for every downstream use in the function. The bug is often not in the code you changed, but in the code you didn't change that assumed the old behavior.
 - **Scrutinize AI reviewer comments** — Agent Cube / bot judges can produce false positives; always verify by reading code
 - **Reply to every comment** — even if skipping a suggestion, explain the reasoning on GitHub
+
+## Provenance
+
+- Base workflow established from recurring PR review/fix cycles across the codebase.
+- Rules on second-order side effects, dedup control-flow tracing, test side-effect coverage, and test-name/assertion alignment added after PR #997 (`V2-380/fix-intermediate-messages`), where a dedup skip path left `touchSession.lastEventAt` unset because the code assumed `assistantEvent` was always non-null (Apr 2026).
+- Framework-level protection check added after PR #1017 (`fix/integrations-search-lag`), where a reviewer flagged a `useEffect` race condition in `useState` ↔ `searchParams` sync that was actually prevented by Next.js's action queue discard mechanism. Reading `app-router-instance.js` source was the only way to verify — official docs were silent on this behavior (Apr 2026).
+- SDK schema verification, JSONB type awareness, no-`as`-assertion, and metadata merge rules added after PR #919 (`feat/composio-org-level-sync`), where: (1) `orderDirection: 'desc'` was silently stripped by `@composio/core`'s Zod `safeParse` because the param wasn't in the schema; (2) `mergeMetadataJson` used `typeof existing !== 'string'` which always evaluated true for JSONB objects from Kysely, skipping the merge and losing `slackAppId` during tombstone resurrection; (3) `as Record<string, unknown>` was rejected by ESLint's `consistent-type-assertions: never` rule, requiring runtime type narrowing instead (Apr 2026).
+- Specialized helper preference (Step 5 #8) added after PR #1059 (`fix/structured-output-bootstrap-rls`), where the bootstrap path manually built a `SystemDbContext` and called `withSystemDb` instead of using the dedicated `withBootstrapSystemDb(reason, fn)` helper (May 2026).
+- Sentry log-level threshold and `beforeSend` preference (Step 5 #9 / #10) added after PR #997 (`V2-380/fix-intermediate-messages`) and PR #1039 (`fix/sentry-ignore-fetch-network-failure`). PR #997 surfaced that `logger.warn` (level 40) is dropped by the pino → Sentry hook (threshold >= 50), letting user-visible content drops disappear silently. PR #1039 surfaced that `ignoreErrors` filters dropped on-error replays and tagged diagnostic captures, so noise filters need `beforeSend` with canary sampling + tag-aware bypass instead. Detailed Sentry patterns are in the dedicated `sentry-observability` skill (May 2026).
+- Pushback reply template (Step 8) added after PR #1038 (`fix/connect-web-27-session-stream-abort`), where declining a `console.warn` on the 499 branch required citing AGENTS.md "swallowing expected errors" and explaining the LB-access-logs alternative. The "investigate-then-report" reply variant comes from PR #997's response pattern around `stripChatTitle`'s built-in `.trim()` (May 2026).
+- Analysis-checklist additions (Step 3) for buffer-then-flush, append-then-write retry safety, real-DB tests on branched WHERE, OpenAPI `required` + nullable, Server Component callback antipattern, and paired container parity added after the same backend / frontend PRs above (Apr–May 2026).
