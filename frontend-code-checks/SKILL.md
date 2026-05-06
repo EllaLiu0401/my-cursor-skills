@@ -992,29 +992,43 @@ const mutation = useActionMutate(generateWeeklyReport, {
 
 **Fix — drop `router.refresh()`** unless the mutation also changed something a server component reads (e.g. modifying a config that the server component fetches). When in doubt, remove it; you can always add it back when a missing-refresh bug appears.
 
-`kysely-codegen` already types nullable columns as `T | null`. `row.titleSource ?? null` is dead code — remove for consistency with the surrounding mapper.
+### 42. Auth0 claim namespace must match `AUTH0_CLAIMS`
 
-**Anti-pattern (PR #992):**
+When mocking `useUser()` in tests, the claim key for roles **must** match the runtime namespace defined in `apps/web/src/lib/auth-constants.ts`. Using a stale or incorrect namespace (e.g. `https://aetheron.io/roles`) causes `getRoleFlags()` to silently return all-false.
+
+**Anti-pattern (PR #1078):**
 ```ts
-return {
-  id: row.id,
-  title: row.title,                       // typed string | null already
-  titleSource: row.titleSource ?? null,   // ← redundant
-  sourceKey: row.sourceKey,
-};
+const SUPERUSER = { 'https://aetheron.io/roles': ['superuser'] };
+// getRoleFlags(SUPERUSER) → { isSuperuser: false } — wrong namespace
 ```
 
-**Fix:**
+**Fix — use the canonical namespace:**
 ```ts
-return {
-  id: row.id,
-  title: row.title,
-  titleSource: row.titleSource,
-  sourceKey: row.sourceKey,
-};
+const SUPERUSER = { 'https://connect.aetheron.app/claims/roles': ['superuser'] };
+// or, import AUTH0_CLAIMS and use AUTH0_CLAIMS.ROLES as the key
 ```
 
-If you need to coerce `undefined` → `null`, the column type is wrong upstream — fix the schema, not every read site.
+Before writing a mock user object, check existing test fixtures (`rg 'connect.aetheron.app/claims/roles' apps/web/src --glob '*.test.*'`) to copy the exact key.
+
+### 43. `mockReturnValueOnce` is fragile with React hooks
+
+`vi.fn().mockReturnValueOnce(...)` is consumed by the first call. React may call hooks multiple times per render (StrictMode double-invocation, SWR revalidation). Once the `Once` mock is consumed, subsequent calls fall through to the default.
+
+**Anti-pattern (PR #1078):**
+```ts
+mockUseUser.mockReturnValueOnce({ user: SUPERUSER });
+render(<MyComponent />);
+// StrictMode renders twice → second call returns default { user: null }
+```
+
+**Fix — set/reset with `mockReturnValue`:**
+```ts
+mockUseUser.mockReturnValue({ user: SUPERUSER });
+render(<MyComponent />);
+mockUseUser.mockReturnValue({ user: null });
+```
+
+This guarantees every hook call during the render sees the intended value.
 
 ## Before-submission checklist
 
@@ -1065,6 +1079,8 @@ Frontend checks:
 - [ ] Every mutation error branch (success / domain-error / generic) answers all three: user feedback, Sentry capture, recovery path
 - [ ] Shared mutation hook has its own `renderHook` test — happy / domain-error / generic / no-callback branches
 - [ ] No `router.refresh()` alongside `invalidateQueries` for the same data
+- [ ] Mock user objects use `https://connect.aetheron.app/claims/roles` (not stale namespaces)
+- [ ] `mockReturnValueOnce` not used for hooks that React may call multiple times — use `mockReturnValue` + reset
 - [ ] `pnpm turbo run typecheck --filter=@aetheronhq/web` PASS
 - [ ] `pnpm turbo run lint --filter=@aetheronhq/web` PASS
 - [ ] `pnpm turbo run test --filter=@aetheronhq/web` PASS
@@ -1083,5 +1099,6 @@ Frontend checks:
 - Rules §22–§30 added after PR #869 (`V2-329/report-config-form`), where: (§22) `toLocaleTimeString(undefined, ...)` caused SSR/client locale drift; (§23) `mutateCallIndex++ % 2` mocks broke silently when hook order changed; (§24) raw `<label>` mixed with DS `FormField` left typography drift on token bumps; (§25) DS `SelectField`'s clearable behaviour shipped `''` to a non-nullable IANA timezone column; (§26) Server Components were threading `t` / `formatDate` callbacks instead of calling `getTranslations()` / `getFormatter()` directly; (§27) `recipients` was tracked in both `defaultValues` and `useState`; (§28) "Last updated" footer rendered blank for fresh rows where `updatedAt` was null; (§29) textareas didn't enforce backend's 4000 / 16000 char caps client-side; (§30) case-insensitive duplicate dedup and `MAX_RECIPIENTS` cap had no tests (May 2026).
 - Rule §31 added after PR #992 (`V2-382/chat-session-title-persistence`), where `row.titleSource ?? null` was a no-op on a `kysely-codegen` `SessionTitleSource | null` column (May 2026).
 - Rules §32–§41 added after PR #1068 (`V2-329/pr3-report-history-viewer`), six rounds of review across CodeRabbit / Codex / Judge Codex / human reviewers. The 10 rules cluster into four concern areas the PR repeatedly tripped on: (a) **Date/time** — §32 (`new Date('YYYY-MM-DD')` parses as UTC midnight, render in local timezone shifts the day for users west of UTC) and §33 (`useMemo(() => fn(new Date()), [])` snapshots the value forever); (b) **React Query defaults under load** — §34 (every query/mutation needs explicit retry/staleTime/suppressGlobalError choices once polling × retry × N viewers is in play), §35 (`meta.suppressGlobalError` was honoured by `MutationCache.onError` but dead code on `QueryCache.onError` until the PR extended it), §41 (`router.refresh()` re-runs the parent server component on top of `invalidateQueries`, doubling RTT); (c) **State machines and content discrimination** — §36 (every status switch needs a `default` arm because backend enums grow), §37 (`if (data)` funnels valid empty strings into the error branch — discriminate via `typeof === 'string'`), §39 (every mutation error branch — success, 409, generic, poll failure — must answer user-feedback / Sentry-capture / recovery-path together; the same hook had each gap separately); (d) **Architecture / API shape** — §38 (`listX({ limit: 100 })` to translate one id to a name silently truncates and uses the wrong tool — use `getX({ id })`), §40 (extracting a shared mutation hook leaves the toast / invalidate / conflict-vs-generic logic untested if both callers `vi.mock` the hook entirely; needs a dedicated `renderHook` test) (May 2026).
+- Rules §42–§43 added after PR #1078 (`fix/voice-label-friendly-names` + custom-voice-settings superuser gate): (§42) test mock used stale Auth0 claim namespace `https://aetheron.io/roles` instead of the canonical `https://connect.aetheron.app/claims/roles`, causing `getRoleFlags()` to silently return all-false and the CI test to find nothing to render; (§43) `mockReturnValueOnce` was consumed by React StrictMode's double-invocation, so the superuser mock fell through to the default `{ user: null }` on the second call — switched to `mockReturnValue` + explicit reset (May 2026).
 
 When new recurring reviewer comments appear on future PRs, extend this file rather than fixing the symptom once.

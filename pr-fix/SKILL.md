@@ -47,21 +47,54 @@ Before analyzing, read the project's architecture docs:
 2. **Based on scope**: relevant `planning/*.md` docs (see `planning/README.md` for index)
 3. **Check codebase**: search for similar patterns/features already implemented as reference
 
-## Step 3: Analyze Each Comment
+## Step 3: Objective Verification (MANDATORY — before any categorization)
 
-For every human reviewer comment, determine:
+⚠️ **CRITICAL: Never accept a reviewer's claim at face value.** Reviewer comments are opinions — they may be correct, partially correct, or wrong. Before deciding whether to fix anything, you MUST independently verify every claim against the actual codebase.
+
+**The failure mode to avoid:** Agreeing with a reviewer because they sound authoritative, because the user seems to want you to fix it, or because the comment "sounds reasonable." This leads to hallucination-driven changes that break working code or add unnecessary complexity.
+
+### For EVERY comment, complete this verification gate:
+
+1. **Read the actual code being discussed** — not just the diff snippet in the comment. Read the full file (or relevant section) to understand the complete context. Comments often reference 5-line snippets but miss the 50-line context that explains _why_ the code is written that way.
+
+2. **Verify the factual claim** — If the reviewer says "this will break when X", prove it: trace the code path, check the types, read the tests. If the reviewer says "this pattern isn't used elsewhere", search the codebase to confirm. If the reviewer says "this violates rule Y", read rule Y and check if it actually applies to this specific case.
+
+3. **Assess from the feature's perspective** — What is this PR trying to accomplish? Does the reviewer's suggestion serve the feature's goal, or does it optimize for a concern orthogonal to the PR's purpose? A suggestion that is "correct in general" but irrelevant to the feature's intent is noise, not signal.
+
+4. **Check if the existing code is actually wrong** — The current code passed CI, was written with intent, and may have been reviewed before. The default assumption should be "the code is correct until proven otherwise", not "the reviewer is correct until proven otherwise."
+
+5. **Evaluate the net impact** — Would the suggested change make the codebase _objectively_ better (fewer bugs, clearer intent, better performance, stronger type safety)? Or is it a lateral move (different but not better) or a subjective preference?
+
+### Verification verdict (record for each comment):
+
+```
+- Claim: {what the reviewer asserts}
+- Evidence: {what you found by reading the actual code / searching the codebase}
+- Verdict: CONFIRMED / PARTIALLY VALID / INCORRECT / SUBJECTIVE PREFERENCE
+- Reasoning: {2-3 sentences of logical justification}
+```
+
+**If you cannot find concrete evidence that the reviewer's claim is correct, do NOT default to fixing it.** Instead, mark it as "Needs clarification" and present both sides to the user.
+
+## Step 3b: Categorize Each Comment (after verification)
+
+Only AFTER completing the objective verification above, categorize each comment:
 
 | Category | Criteria | Action |
 |----------|----------|--------|
-| **Bug / Must-fix** | Incorrect behavior, security issue, rule violation | Fix required |
-| **Valid improvement** | DRY, robustness, consistency — simple fix | Fix recommended |
+| **Bug / Must-fix** | **Verified** incorrect behavior, security issue, or rule violation with evidence | Fix required |
+| **Valid improvement** | **Verified** DRY, robustness, consistency issue — simple fix, net positive | Fix recommended |
 | **Test coverage** | Reviewer asks for tests or flags missing coverage | **Always add tests** |
 | **Already fixed** | Author replied "fixed in commit X" or code shows fix | Verify fix is in place |
 | **Nitpick / Informational** | Style preference, FYI, "not blocking" | No change needed |
+| **Subjective / Unverified** | Reviewer's claim could not be confirmed by reading the code | Present both sides to user |
 | **Over-engineering risk** | Suggestion adds complexity without clear value | Push back (KISS) |
+| **Incorrect** | Reviewer's claim is factually wrong based on codebase evidence | Skip, explain why |
 
 ### Analysis checklist per comment
 
+- [ ] **Did I actually read the code?** (not just the diff — the full relevant context)
+- [ ] **Did I verify the claim with evidence?** (not just "it sounds right")
 - [ ] Is this comment about a real bug or just a suggestion?
 - [ ] Does the current code already address this? (check latest commit)
 - [ ] Is the suggested fix the **simplest** solution? (KISS — always ask this)
@@ -105,19 +138,23 @@ Format:
 
 **Comment 1: {short title}**
 > {quote the comment}
-- Category: {Bug / Valid improvement / Nitpick / ...}
-- Analysis: {your assessment — is it correct? what's the simplest fix?}
-- Recommendation: {Fix / Skip / Already addressed}
+- Reviewer's claim: {what the reviewer asserts}
+- Verification: {what you actually found by reading the code}
+- Verdict: CONFIRMED / PARTIALLY VALID / INCORRECT / SUBJECTIVE PREFERENCE
+- Category: {Bug / Valid improvement / Nitpick / Subjective / Incorrect / ...}
+- Recommendation: {Fix / Skip / Already addressed / Push back}
+- Reasoning: {logical justification — why fix or why not, based on evidence}
 - Impact: {what changes, what files affected}
 
 **Comment 2: ...**
 
 ### Summary
-| # | Comment | Category | Recommendation |
-|---|---------|----------|----------------|
-| 1 | ... | Bug | Fix |
-| 2 | ... | Nitpick | Skip |
-| 3 | ... | Test coverage | Add tests |
+| # | Comment | Verdict | Category | Recommendation |
+|---|---------|---------|----------|----------------|
+| 1 | ... | CONFIRMED | Bug | Fix |
+| 2 | ... | SUBJECTIVE | Nitpick | Skip |
+| 3 | ... | CONFIRMED | Test coverage | Add tests |
+| 4 | ... | INCORRECT | — | Skip (explain) |
 ```
 
 ### After presenting, ASK:
@@ -257,7 +294,11 @@ The reply pattern: state the investigation, cite the implementation, name the co
 
 ## Key Principles
 
-- **Always ask before changing code** — present analysis first, wait for approval
+- **Verify before you believe** — every reviewer claim must be checked against actual code. Sounding reasonable ≠ being correct. Read the code, trace the logic, find evidence.
+- **Code is the source of truth, not opinions** — if the code works, passes CI, and follows project patterns, the burden of proof is on the reviewer to show why it's wrong, not on you to assume it is.
+- **Never hallucinate agreement** — if you can't verify a claim, say so. "I couldn't confirm this" is always better than silently going along. Presenting both sides to the user is the correct action when uncertain.
+- **Distinguish objective issues from subjective preferences** — bugs, type errors, and rule violations are objective. "I would have written it differently" is subjective. Only objective issues warrant code changes.
+- **Always ask before changing code** — present analysis with verification evidence first, wait for approval
 - **Always add tests** when reviewers flag missing coverage
 - **KISS** — for every fix, ask "is this the simplest solution?"
 - **Check references** — search codebase for existing patterns before inventing new ones
