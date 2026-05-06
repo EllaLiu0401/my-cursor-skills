@@ -1,6 +1,6 @@
 ---
 name: frontend-code-checks
-description: Pre-submission checks for Aetheron Connect V2 frontend code in apps/web. Captures recurring reviewer feedback (HTML semantics, img hygiene, silent catch, utility reuse, DS prop conventions, visual state single-source-of-truth) so the agent surfaces these issues before the PR is opened. Use whenever writing or editing code under apps/web, migrating cards to EntityCard, introducing a shared utility, or before marking a frontend task complete.
+description: Pre-submission checks for Aetheron Connect V2 frontend code in apps/web. Captures recurring reviewer feedback (HTML semantics, img hygiene, silent catch, utility reuse, DS prop conventions, visual state single-source-of-truth, React Query retry/staleTime/suppressGlobalError defaults, timezone-safe date rendering, status-enum forward-compat, mutation error three-thing rule, single-record API lookup over listX(limit:100), shared hook test coverage) so the agent surfaces these issues before the PR is opened. Use whenever writing or editing code under apps/web, adding a useQuery/useMutation, rendering a date-only string, branching on a backend status enum, looking up a single entity by id, extracting a shared hook, or before marking a frontend task complete.
 ---
 
 # Frontend Code Checks (apps/web)
@@ -707,6 +707,315 @@ return {
 
 If you need to coerce `undefined` → `null`, the column type is wrong upstream — fix the schema, not every read site.
 
+### 32. Date-only strings need `timeZone: 'UTC'` when rendered
+
+`new Date('YYYY-MM-DD')` parses as **UTC midnight**, not local. `format.dateTime` / `toLocaleDateString` then renders in the runtime locale's timezone, so users west of UTC see the **previous calendar day**.
+
+**Anti-pattern (PR #1068):**
+```tsx
+const start = format.dateTime(new Date(report.periodStart), {
+  month: 'short',
+  day: 'numeric',
+}); // user in UTC-5 sees April 12 for periodStart='2026-04-13'
+```
+
+**Fix — pin the timezone explicitly:**
+```tsx
+const start = format.dateTime(new Date(report.periodStart), {
+  month: 'short',
+  day: 'numeric',
+  timeZone: 'UTC',
+});
+```
+
+Apply everywhere a date-only string from the API is rendered. The fix is the same pair of surfaces in this PR (`WeeklyReportList.formatPeriod` + `WeeklyReportViewer.periodLabel`) — when you see one, grep the codebase for siblings.
+
+**Decision rule:** if the string has no timezone/offset (`'2026-04-13'`, `'2026-04-13T00:00:00'`), pin `timeZone: 'UTC'`. If it has an offset (`'2026-04-13T00:00:00+10:00'`), local rendering is fine.
+
+### 33. `useMemo` of "current time" doesn't refresh on modal reopen
+
+`useMemo(() => somethingTimeBased(), [])` snapshots the value when the component first mounts. Long-lived tabs cross midnight and the modal still shows yesterday's defaults.
+
+**Anti-pattern (PR #1068):**
+```tsx
+const defaults = useMemo(() => lastCompletedWeek(new Date()), []);
+const [periodStart, setPeriodStart] = useState(defaults.start);
+
+useEffect(() => {
+  if (!open) return;
+  setPeriodStart(defaults.start); // still last week's stale value
+}, [open]);
+```
+
+**Fix — recompute inside the open-reset effect:**
+```tsx
+useEffect(() => {
+  if (!open) return;
+  const fresh = lastCompletedWeek(new Date());
+  setPeriodStart(fresh.start);
+  setPeriodEnd(fresh.end);
+}, [open]);
+```
+
+Trigger scenarios: modal/dialog defaults derived from current time, "today" pickers, "this week" filters, recently-viewed shortlists.
+
+### 34. Three-decision checklist for every `useQuery` / `useMutation`
+
+Before declaring a query/mutation done, answer all three questions explicitly. Defaults bite hardest when interval × retry × component count multiplies.
+
+| Decision | Default | When to override |
+|---|---|---|
+| **`retry`** | 4 retries | `retry: false` for: short-poll intervals (every-10s polls × 4 retries = 5s of flooding per failure), 409-conflict mutations (retry hits the same row → phantom toast race), expected-error paths (`not_found`, `unauthorized`) |
+| **`staleTime`** | `0` | For data with TTL bounds (presigned URLs ~1h), set just under the TTL. **Conditional `staleTime` for null fallbacks**: `staleTime: (q) => q.state.data === null ? 0 : 50 * 60_000` — null means transient failure, refetch on next mount instead of pinning the inline error banner. |
+| **`meta.suppressGlobalError`** | dead code unless your `QueryProvider` honours it (see §35) | Polling, expected 404s, or any path where the local UI already surfaces the failure |
+
+**Anti-pattern (PR #1068):**
+```ts
+return useQuery({
+  queryKey: ['report-poll', id],
+  queryFn: () => getWeeklyReport({ path: { id } }),
+  refetchInterval: 10_000, // ← 10s × default retry: 4 = 4 captures per error per viewer
+});
+```
+
+**Fix:**
+```ts
+return useQuery({
+  queryKey: ['weekly-reports', id],
+  queryFn: async () => { /* + Sentry capture inside */ },
+  refetchInterval: (q) =>
+    q.state.data?.status === 'pending' || q.state.data?.status === 'processing'
+      ? 10_000
+      : false,
+  retry: false,
+  meta: { suppressGlobalError: true },
+});
+```
+
+### 35. `meta.suppressGlobalError` is asymmetric — verify both caches honour it
+
+`QueryClient` exposes two error pipelines: `MutationCache.onError` and `QueryCache.onError`. The `meta.suppressGlobalError` convention is opt-in **per cache** — wiring it on one without the other makes the flag dead code on the other side.
+
+**Anti-pattern (PR #1068, before fix):**
+```ts
+// QueryProvider.tsx
+const queryClient = new QueryClient({
+  mutationCache: new MutationCache({
+    onError: (error, _vars, _ctx, mutation) => {
+      if (mutation.options.meta?.suppressGlobalError) return; // ← only honoured here
+      handleQueryError(error);
+    },
+  }),
+  queryCache: new QueryCache({
+    onError: (error) => handleQueryError(error), // ← always fires globally
+  }),
+});
+
+// useReportContent.ts — flag is dead code
+return useQuery({ /* ... */, meta: { suppressGlobalError: true } });
+```
+
+**Fix — mirror the bypass in `QueryCache.onError`:**
+```ts
+queryCache: new QueryCache({
+  onError: (error, query) => {
+    if (query.meta?.['suppressGlobalError']) {
+      console.warn('[Query Error - handled locally]', error);
+      return;
+    }
+    handleQueryError(error);
+  },
+}),
+```
+
+**Review-time check:** when you see `meta: { suppressGlobalError: true }` on a `useQuery`, grep `QueryProvider.tsx` for the `QueryCache.onError` branch. If it's missing, the flag is doing nothing.
+
+### 36. Status enum from backend is forward-compat — UI must have a `default` branch
+
+Backend `status` columns grow over time (`pending | processing | completed | failed` → adds `cancelled` next quarter). UI `switch` / multi-`if` chains that exhaustively match the four current literals render **blank** for any future status the UI hasn't been taught about.
+
+**Anti-pattern (PR #1068):**
+```tsx
+if (status === 'pending') return <Pending />;
+if (status === 'processing') return <Processing />;
+if (status === 'completed') return <Completed />;
+if (status === 'failed') return <Failed />;
+// future 'cancelled' renders nothing
+```
+
+**Fix — explicit default with a placeholder:**
+```tsx
+if (status === 'pending') return <Pending />;
+if (status === 'processing') return <Processing />;
+if (status === 'completed') return <Completed />;
+if (status === 'failed') return <Failed />;
+return <CardValue empty>{tViewer('noContent')}</CardValue>;
+```
+
+**Apply when:** rendering badges, content cards, or icons keyed off a backend enum string. Same rule for `WeeklyReportStatusBadge`-style components — at least pass the raw string through as a fallback label.
+
+**Test it:** cast a fictional status (`'cancelled' as unknown as Status`) into the component and assert the default branch renders.
+
+### 37. `if (data)` truthy check vs `typeof data === 'string'` — empty strings are valid content
+
+For optional content that may legitimately be empty (markdown for a week with no calls, comment for a row with nothing flagged), a truthy check funnels `data === ''` into the error/empty branch and the user sees "load failed" for healthy data.
+
+**Anti-pattern (PR #1068):**
+```tsx
+if (contentQuery.data) return <MarkdownViewer content={contentQuery.data} />;
+return <ContentLoadError />; // empty markdown lands here
+```
+
+**Fix — discriminate on type:**
+```tsx
+if (typeof contentQuery.data === 'string') return <MarkdownViewer content={contentQuery.data} />;
+return <ContentLoadError />; // only `null` / `undefined` reach here
+```
+
+**Decision table:** when the union is `string | null` and `''` is a valid value, use `typeof === 'string'` (or `data !== null`). When the union is `string | undefined` and the difference doesn't matter, truthy is fine — but document the assumption.
+
+**Trigger scenarios:** markdown / HTML / plain-text content from blob storage, optional descriptions / notes / instructions, transcripts that may be silent.
+
+### 38. `listX(limit:100)` for a single name lookup is the wrong tool — use `getX(id)`
+
+Pages that fetch a list only to translate one foreign-key id into a name pay the cost of the full list AND silently lose the lookup once the org crosses the cap.
+
+**Anti-pattern (PR #1068):**
+```tsx
+const [config, assistants] = await Promise.all([
+  getReportConfig({ path: { id } }),
+  listAssistants({ query: { limit: 100 } }),
+]);
+const assistantMap = new Map((assistants.data?.items ?? []).map((a) => [a.id, a.name]));
+const assistantName = assistantMap.get(config.assistantId) ?? config.assistantId; // bare UUID for 101st+
+```
+
+**Fix — single-record fetch:**
+```tsx
+const result = await getReportConfig({ path: { id } });
+const config = result.data;
+let assistantName: string | null = null;
+if (config.assistantId) {
+  const assistantResult = await getAssistant({ path: { id: config.assistantId } });
+  assistantName = assistantResult.data?.name ?? t('reports.unknownAssistant');
+}
+```
+
+**Trigger scenarios:** any detail / viewer page that fetches a list to render a single label or breadcrumb. Common offenders:
+
+- `listAssistants({ limit: 100 })` for one `assistantId`
+- `listVoices({ limit: 100 })` for one `voiceId`
+- `listOrgs(...)` for one `orgId` on a member detail page
+
+**Review-time grep:** `rg "list\w+\(\{ query: \{ limit:" apps/web/src/app` — for each match, ask "is this for a list view, or is it a one-record lookup pretending to be a list?"
+
+**Don't fix in this PR if:** the page genuinely renders the list AND uses one entry from it. Then the cap is a separate problem (paged select, `listAll` helper) — flag as follow-up.
+
+### 39. Mutation success ≠ "toast and done" — every error branch needs the three-thing check
+
+Every error path in a mutation must answer all three questions, not just the first:
+
+1. **Does the user see a clear next step?** (toast / banner / inline message)
+2. **Does Sentry have a tagged signal?** (`Sentry.captureException(err, { tags: { errorBoundary: '...' } })` — see `sentry-observability` skill)
+3. **Can the user actually move forward?** (cache invalidation, polling restart, focus return, retry button)
+
+PR #1068 had the same mutation hit each gap separately:
+
+| Branch | Gap | Fix |
+|---|---|---|
+| 409 conflict | Toast fires but viewer stays on `failed` Alert + Retry forever (poll's `refetchInterval` is `false` for `failed`, no path back to `processing`) | Add `invalidateQueries({ queryKey: ['weekly-reports'] })` to the conflict branch — same as `onSuccess` — so the existing row refreshes and poll picks up the new status |
+| Generic error | `suppressGlobalError + throw` silently swallows (mutation handler suppresses, viewer doesn't surface) | Replace `throw error` with `toast.error(tErrors('generic'))` |
+| Poll failure | `retry: false + suppressGlobalError` together silence Sentry too | Add `Sentry.captureException(err, { tags: { hook: 'useReportPoll', errorBoundary: 'useReportPoll-failure' }, extra: { reportId } })` inside the queryFn before throwing |
+
+**Apply when:** writing any mutation `onError`, any polling queryFn, any `.catch(() => fallback)` in async UI code.
+
+**Smell:** if you can answer "what does the user see?" but you can't answer "what does Sentry see?" or "can the user click out of this state?", you have a partial fix.
+
+### 40. Shared hooks need their own tests — caller mocks aren't enough
+
+When a hook is extracted from two callers (e.g. `useGenerateWeeklyReport` factored out of `GenerateReportModal` and `WeeklyReportViewer`), the existing component tests almost always mock the hook entirely (`vi.mock('@/hooks/useWeeklyReports', ...)`) so the hook's own logic — toast copy, `invalidateQueries`, conflict-vs-generic mapping, `onGenerated` callback — has zero coverage.
+
+**Anti-pattern (PR #1068, before follow-up):**
+```ts
+// useWeeklyReports.test.ts: tests useReportContent + useReportPoll, but NOT useGenerateWeeklyReport
+// WeeklyReportViewer.test.tsx: vi.mocks the whole hook → no real coverage of toast/invalidate
+// GenerateReportModal.test.tsx: same
+```
+
+**Fix — `renderHook` test for the shared hook:**
+```ts
+import { renderHook, waitFor } from '@testing-library/react';
+
+it('treats a 409 conflict as a soft success: conflict toast + invalidate + onGenerated', async () => {
+  mockGenerateAction.mockResolvedValue({ error: { code: 'conflict', statusCode: 409 } } as Awaited<ReturnType<typeof generateAction>>);
+  const onGenerated = vi.fn();
+  const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+  const invalidateSpy = vi.spyOn(queryClient, 'invalidateQueries');
+  const wrapper = ({ children }) => createElement(QueryClientProvider, { client: queryClient }, children);
+
+  const { result } = renderHook(() => useGenerateWeeklyReport({ onGenerated }), { wrapper });
+  result.current.mutate(buildBody());
+
+  await waitFor(() => expect(result.current.status).toBe('error'));
+  expect(mockToastError).toHaveBeenCalledWith('common.reports.viewer.generateConflict');
+  expect(onGenerated).toHaveBeenCalledTimes(1);
+  expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['weekly-reports'] });
+});
+```
+
+**Coverage targets for any shared mutation hook:**
+- happy path: success toast + invalidate + callback
+- the conflict / domain-specific error code: dedicated toast + invalidate + callback (the "soft success" branch)
+- generic error: generic toast, **no** invalidate, **no** callback, error propagates
+- works when the optional callback isn't provided (don't crash)
+
+**Review-time check:** when a PR extracts a shared hook, grep the test file for `renderHook(() => useTheNewHook(`. Zero matches means the hook is tested only through its callers' mocks — flag the gap.
+
+### 41. `router.refresh()` is redundant after `invalidateQueries`
+
+`router.refresh()` re-runs the parent server component (with all its `await` data fetches) and re-renders the route. Calling it alongside `invalidateQueries({ queryKey: [...] })` for the same data is double-work — pick one based on **who owns the data**.
+
+**Decision rule:**
+- Data fetched by a Server Component (`await listAssistants(...)` in `page.tsx`) → `router.refresh()`
+- Data fetched by a client React Query hook (`useWeeklyReports`) → `invalidateQueries`
+- Both? Keep only the React Query path; the server component prop will be re-read on the next genuine navigation.
+
+**Anti-pattern (PR #1068):**
+```tsx
+const mutation = useActionMutate(generateWeeklyReport, {
+  onSuccess: () => {
+    queryClient.invalidateQueries({ queryKey: ['weekly-reports'] }); // already refreshes the list
+    router.refresh(); // ← also re-fetches listReportConfigs + listAssistants(100). Wasted RTT.
+  },
+});
+```
+
+**Fix — drop `router.refresh()`** unless the mutation also changed something a server component reads (e.g. modifying a config that the server component fetches). When in doubt, remove it; you can always add it back when a missing-refresh bug appears.
+
+`kysely-codegen` already types nullable columns as `T | null`. `row.titleSource ?? null` is dead code — remove for consistency with the surrounding mapper.
+
+**Anti-pattern (PR #992):**
+```ts
+return {
+  id: row.id,
+  title: row.title,                       // typed string | null already
+  titleSource: row.titleSource ?? null,   // ← redundant
+  sourceKey: row.sourceKey,
+};
+```
+
+**Fix:**
+```ts
+return {
+  id: row.id,
+  title: row.title,
+  titleSource: row.titleSource,
+  sourceKey: row.sourceKey,
+};
+```
+
+If you need to coerce `undefined` → `null`, the column type is wrong upstream — fix the schema, not every read site.
+
 ## Before-submission checklist
 
 Copy this at the end of a frontend task:
@@ -746,6 +1055,16 @@ Frontend checks:
 - [ ] Textarea `maxLength` mirrors backend cap
 - [ ] Case-insensitive validations and `MAX_*` caps have explicit tests
 - [ ] No `?? null` on `kysely-codegen` `T | null` fields
+- [ ] Date-only strings (`'YYYY-MM-DD'`) rendered with `timeZone: 'UTC'` (or via `next-intl` `format.dateTime`)
+- [ ] `useMemo(() => somethingTimeBased(), [])` recomputed in modal/dialog open-reset effect
+- [ ] Every `useQuery` / `useMutation` has explicit choices for `retry`, `staleTime`, and `meta.suppressGlobalError` — defaults verified safe under polling × retry × component count
+- [ ] If using `meta.suppressGlobalError`, `QueryProvider`'s `QueryCache.onError` (not just `MutationCache.onError`) honours it
+- [ ] Status-enum branching has a `default` arm — backend enum is forward-compat
+- [ ] Empty-string-as-valid-content uses `typeof data === 'string'`, not `if (data)`
+- [ ] One-name-by-id lookups use `getX({ id })`, not `listX({ limit: 100 })`
+- [ ] Every mutation error branch (success / domain-error / generic) answers all three: user feedback, Sentry capture, recovery path
+- [ ] Shared mutation hook has its own `renderHook` test — happy / domain-error / generic / no-callback branches
+- [ ] No `router.refresh()` alongside `invalidateQueries` for the same data
 - [ ] `pnpm turbo run typecheck --filter=@aetheronhq/web` PASS
 - [ ] `pnpm turbo run lint --filter=@aetheronhq/web` PASS
 - [ ] `pnpm turbo run test --filter=@aetheronhq/web` PASS
@@ -763,5 +1082,6 @@ Frontend checks:
 - Rule §21 added after PR #990 (`V2-376/agent-config-support-banner-cutoff`), where the loading container kept `flex flex-1 min-h-0` but the error container dropped to `flex-1 min-h-0` — paired state containers must share the same className shape (May 2026).
 - Rules §22–§30 added after PR #869 (`V2-329/report-config-form`), where: (§22) `toLocaleTimeString(undefined, ...)` caused SSR/client locale drift; (§23) `mutateCallIndex++ % 2` mocks broke silently when hook order changed; (§24) raw `<label>` mixed with DS `FormField` left typography drift on token bumps; (§25) DS `SelectField`'s clearable behaviour shipped `''` to a non-nullable IANA timezone column; (§26) Server Components were threading `t` / `formatDate` callbacks instead of calling `getTranslations()` / `getFormatter()` directly; (§27) `recipients` was tracked in both `defaultValues` and `useState`; (§28) "Last updated" footer rendered blank for fresh rows where `updatedAt` was null; (§29) textareas didn't enforce backend's 4000 / 16000 char caps client-side; (§30) case-insensitive duplicate dedup and `MAX_RECIPIENTS` cap had no tests (May 2026).
 - Rule §31 added after PR #992 (`V2-382/chat-session-title-persistence`), where `row.titleSource ?? null` was a no-op on a `kysely-codegen` `SessionTitleSource | null` column (May 2026).
+- Rules §32–§41 added after PR #1068 (`V2-329/pr3-report-history-viewer`), six rounds of review across CodeRabbit / Codex / Judge Codex / human reviewers. The 10 rules cluster into four concern areas the PR repeatedly tripped on: (a) **Date/time** — §32 (`new Date('YYYY-MM-DD')` parses as UTC midnight, render in local timezone shifts the day for users west of UTC) and §33 (`useMemo(() => fn(new Date()), [])` snapshots the value forever); (b) **React Query defaults under load** — §34 (every query/mutation needs explicit retry/staleTime/suppressGlobalError choices once polling × retry × N viewers is in play), §35 (`meta.suppressGlobalError` was honoured by `MutationCache.onError` but dead code on `QueryCache.onError` until the PR extended it), §41 (`router.refresh()` re-runs the parent server component on top of `invalidateQueries`, doubling RTT); (c) **State machines and content discrimination** — §36 (every status switch needs a `default` arm because backend enums grow), §37 (`if (data)` funnels valid empty strings into the error branch — discriminate via `typeof === 'string'`), §39 (every mutation error branch — success, 409, generic, poll failure — must answer user-feedback / Sentry-capture / recovery-path together; the same hook had each gap separately); (d) **Architecture / API shape** — §38 (`listX({ limit: 100 })` to translate one id to a name silently truncates and uses the wrong tool — use `getX({ id })`), §40 (extracting a shared mutation hook leaves the toast / invalidate / conflict-vs-generic logic untested if both callers `vi.mock` the hook entirely; needs a dedicated `renderHook` test) (May 2026).
 
 When new recurring reviewer comments appear on future PRs, extend this file rather than fixing the symptom once.
