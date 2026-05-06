@@ -1,3 +1,8 @@
+---
+name: ui-ux-pro-max
+description: External design reference for web/mobile UI inspiration — 67 styles, 96 color palettes, 57 font pairings, 99 UX guidelines, 25 chart types across 13 tech stacks. Use when the user asks for design inspiration, style/color/typography recommendations, UX patterns, or "how should this look". IMPORTANT — Aetheron project boundary: when working inside aetheron-connect-v2 (apps/web) or aetheron-design-system, do NOT recommend external patterns from this skill. Instead, the work must conform to the in-house Aetheron Design System — defer to the ds-code-authoring / ds-pr-review / frontend-code-checks skills, and use this skill only as a sanity check that the DS choice aligns with general UX principles.
+---
+
 # ui-ux-pro-max
 
 Comprehensive design guide for web and mobile applications. Contains 67 styles, 96 color palettes, 57 font pairings, 99 UX guidelines, and 25 chart types across 13 technology stacks. Searchable database with priority-based recommendations.
