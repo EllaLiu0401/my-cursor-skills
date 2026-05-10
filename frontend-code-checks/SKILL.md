@@ -1030,6 +1030,169 @@ mockUseUser.mockReturnValue({ user: null });
 
 This guarantees every hook call during the render sees the intended value.
 
+### 44. Picker default normalization — store `''`, don't show two rows for the same option
+
+When a `<Select>` / `<RadioGroup>` form picker has a "platform default" preset and the stored value is the literal default id, the UI ends up showing **both** the raw id row AND the preset row. The user sees `4Hm8iqw2xCZz1wwdml3H` and "Aetheron Australian" as two separate options for the same voice.
+
+**Anti-pattern (PR #1078):**
+```tsx
+const initialVoiceId = assistant.voiceId; // === platform default
+<VoiceSelect
+  value={initialVoiceId}                    // raw id row lights up
+  options={[
+    { value: '', label: 'Aetheron Australian (default)' }, // preset row also visible
+    ...customVoices,
+  ]}
+/>
+```
+
+**Fix — normalize at read-in:**
+```tsx
+const { vapiVoiceId } = useFeatureFlags();
+const initialVoiceId = assistant.voiceId === vapiVoiceId ? '' : assistant.voiceId;
+
+<VoiceSelect
+  value={initialVoiceId}      // '' → default row lights up uniquely
+  options={[
+    { value: '', label: 'Aetheron Australian (default)' },
+    ...customVoices,
+  ]}
+/>
+```
+
+On submit, denormalize: `submitVoiceId = formValue === '' ? defaultId : formValue` if the API column is non-nullable, or pass `null` if the API treats `null` as "use platform default".
+
+**Apply when:** any picker with a presetable platform default — voice, font, model, brand theme, locale fallback, default-org switcher.
+
+**Test it:** render with `assistant.voiceId === defaultId` → only the preset row should be selected; render with a custom id → only the custom row should be selected. A snapshot test of the option list catches duplicate rows.
+
+### 45. Custom-override resources — render the form picker as read-only
+
+When a resource supports both an inline form value and an out-of-band "custom override" (e.g. custom voice uploaded via a separate admin API, custom workflow assigned by an integration), the form picker should detect the override and render as read-only.
+
+**Anti-pattern (PR #1078):**
+```tsx
+<VoiceSelect
+  value={assistant.voiceId}          // shows custom voice id like 'custom_aaa…'
+  options={presetVoices}             // dropdown lets user pick a preset, silently overwriting the override
+  onChange={(v) => mutate({ voiceId: v })}
+/>
+```
+
+A user clicks a preset, the form quietly overwrites the custom voice override on save, the override metadata in the override-API DB row goes orphaned. There's no way to recover from the form UI.
+
+**Fix — detect and lock:**
+```tsx
+const hasOverride = isCustomVoiceId(assistant.voiceId);
+
+if (hasOverride) {
+  return (
+    <FormField label={t('form.voice')} hint={t('form.voiceManagedByOverride')}>
+      <ReadOnlyValue value={voiceOverrideLabel} />
+      <Text variant='hint'>{t('form.voiceOverrideHint')}</Text>
+    </FormField>
+  );
+}
+
+return <VoiceSelect ... />;
+```
+
+Document the API boundary (form-edit endpoint vs override endpoint) in a hint so the user knows where to make the change.
+
+**Apply when:** any form field whose value can be set out-of-band by an admin tool / integration / managed override. The form is the wrong place to mutate it casually.
+
+**Test it:** render with a custom-override fixture → assert the picker is not in the DOM (or `disabled`) and the read-only label / hint appear.
+
+### 46. Optimistic toggles + auto-rollback via `useEffect([serverState])`
+
+For section toggles backed by a mutation (SMS-enabled, hotel-availability, integration-active), optimistic UI is the right pattern. But instead of explicit `onError` rollback callbacks, drive auto-rollback off the server state.
+
+**Anti-pattern (PR #1116):**
+```tsx
+const [optimistic, setOptimistic] = useState(initial);
+const mutation = useMutation({
+  mutationFn: setEnabled,
+  onError: () => setOptimistic(initial), // stale `initial` capture; loses fresh server state
+});
+```
+
+The closure captures the `initial` from the render where the mutation was created, not the latest server value. After two failed attempts, the rollback target diverges from what the API actually has.
+
+**Fix — server state is the single source of truth, optimistic state mirrors via effect:**
+```tsx
+const { data: serverState } = useQuery(...);
+const [optimistic, setOptimistic] = useState(serverState?.enabled ?? false);
+
+// Reset whenever the server's view changes — both happy path and rollback flow through here.
+useEffect(() => {
+  if (serverState) setOptimistic(serverState.enabled);
+}, [serverState?.enabled]);
+
+const mutation = useMutation({
+  mutationFn: setEnabled,
+  onMutate: ({ enabled }) => setOptimistic(enabled),
+  onSettled: () => queryClient.invalidateQueries(serverQuery), // auto-resyncs via the effect above
+});
+```
+
+**Why this is simpler:**
+- One rollback path (the effect), not two (`onError` + `onSettled`).
+- `serverState` is always the source of truth — closures can't go stale.
+- Works correctly across re-mounts, refetches, and concurrent toggle attempts.
+
+**Apply when:** any "toggle a thing" or "switch one of N values" UI where the user expects instant feedback but the server is authoritative.
+
+**Test it:** drive `serverState` from `false` → `true` after the optimistic flip; assert the optimistic value matches. Drive `serverState` back to `false` after a failed save; assert auto-rollback.
+
+### 47. Test mutations of `process.env` must snapshot + restore
+
+When a Vitest test sets a `process.env.X` value (feature flag, region, deployment env), the mutation persists across sibling test files unless explicitly restored. Vitest's `isolate: true` default helps but does not cover env vars.
+
+**Anti-pattern (PR #1110):**
+```ts
+describe('client config', () => {
+  it('uses prod when NEXT_PUBLIC_DEPLOYMENT_ENV=prod', () => {
+    process.env.NEXT_PUBLIC_DEPLOYMENT_ENV = 'prod';
+    expect(loadConfig().endpoint).toBe('https://api.prod...');
+  });
+  // next test file inherits NEXT_PUBLIC_DEPLOYMENT_ENV='prod' if isolate flips
+});
+```
+
+**Fix — snapshot in `beforeEach`, restore in `afterEach`:**
+```ts
+const ENV_KEYS = ['NEXT_PUBLIC_DEPLOYMENT_ENV', 'NEXT_PUBLIC_SENTRY_DSN'] as const;
+
+describe('client config', () => {
+  const originals: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    for (const key of ENV_KEYS) originals[key] = process.env[key];
+  });
+
+  afterEach(() => {
+    for (const key of ENV_KEYS) {
+      if (originals[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = originals[key];
+      }
+    }
+  });
+
+  it('uses prod when NEXT_PUBLIC_DEPLOYMENT_ENV=prod', () => {
+    process.env.NEXT_PUBLIC_DEPLOYMENT_ENV = 'prod';
+    expect(loadConfig().endpoint).toBe('https://api.prod...');
+  });
+});
+```
+
+**Decision rule:**
+- Use `vi.stubEnv('KEY', 'value')` + `vi.unstubAllEnvs()` in `afterEach` if the project uses Vitest 1.0+ with that helper enabled.
+- Otherwise use the snapshot pattern above. Don't rely on `process.env.X = undefined` — it sets the string `'undefined'`; use `delete process.env.X`.
+
+**Apply when:** any test that reads or writes `process.env`. Especially Sentry config tests, deployment-env tests, feature-flag tests where the env-var resolves the source of truth.
+
 ## Before-submission checklist
 
 Copy this at the end of a frontend task:
@@ -1081,6 +1244,11 @@ Frontend checks:
 - [ ] No `router.refresh()` alongside `invalidateQueries` for the same data
 - [ ] Mock user objects use `https://connect.aetheron.app/claims/roles` (not stale namespaces)
 - [ ] `mockReturnValueOnce` not used for hooks that React may call multiple times — use `mockReturnValue` + reset
+- [ ] Picker default normalized to `''`/`null` so the preset row is the single highlighted option (no duplicate raw-id + label rows)
+- [ ] Custom-override resources render the form picker as read-only with a hint pointing to the override API
+- [ ] Optimistic toggles drive auto-rollback off `useEffect([serverState])`, not stale-closure `onError` callbacks
+- [ ] Tests that mutate `process.env` snapshot in `beforeEach` and restore (or `delete`) in `afterEach` — never leave env mutations leaking across files
+- [ ] Global error handlers / network-error predicates / toast cooldowns / server→client feature-flag plumbing follow the dedicated `frontend-error-handling` skill
 - [ ] `pnpm turbo run typecheck --filter=@aetheronhq/web` PASS
 - [ ] `pnpm turbo run lint --filter=@aetheronhq/web` PASS
 - [ ] `pnpm turbo run test --filter=@aetheronhq/web` PASS
@@ -1100,5 +1268,8 @@ Frontend checks:
 - Rule §31 added after PR #992 (`V2-382/chat-session-title-persistence`), where `row.titleSource ?? null` was a no-op on a `kysely-codegen` `SessionTitleSource | null` column (May 2026).
 - Rules §32–§41 added after PR #1068 (`V2-329/pr3-report-history-viewer`), six rounds of review across CodeRabbit / Codex / Judge Codex / human reviewers. The 10 rules cluster into four concern areas the PR repeatedly tripped on: (a) **Date/time** — §32 (`new Date('YYYY-MM-DD')` parses as UTC midnight, render in local timezone shifts the day for users west of UTC) and §33 (`useMemo(() => fn(new Date()), [])` snapshots the value forever); (b) **React Query defaults under load** — §34 (every query/mutation needs explicit retry/staleTime/suppressGlobalError choices once polling × retry × N viewers is in play), §35 (`meta.suppressGlobalError` was honoured by `MutationCache.onError` but dead code on `QueryCache.onError` until the PR extended it), §41 (`router.refresh()` re-runs the parent server component on top of `invalidateQueries`, doubling RTT); (c) **State machines and content discrimination** — §36 (every status switch needs a `default` arm because backend enums grow), §37 (`if (data)` funnels valid empty strings into the error branch — discriminate via `typeof === 'string'`), §39 (every mutation error branch — success, 409, generic, poll failure — must answer user-feedback / Sentry-capture / recovery-path together; the same hook had each gap separately); (d) **Architecture / API shape** — §38 (`listX({ limit: 100 })` to translate one id to a name silently truncates and uses the wrong tool — use `getX({ id })`), §40 (extracting a shared mutation hook leaves the toast / invalidate / conflict-vs-generic logic untested if both callers `vi.mock` the hook entirely; needs a dedicated `renderHook` test) (May 2026).
 - Rules §42–§43 added after PR #1078 (`fix/voice-label-friendly-names` + custom-voice-settings superuser gate): (§42) test mock used stale Auth0 claim namespace `https://aetheron.io/roles` instead of the canonical `https://connect.aetheron.app/claims/roles`, causing `getRoleFlags()` to silently return all-false and the CI test to find nothing to render; (§43) `mockReturnValueOnce` was consumed by React StrictMode's double-invocation, so the superuser mock fell through to the default `{ user: null }` on the second call — switched to `mockReturnValue` + explicit reset (May 2026).
+- Rules §44–§45 added after PR #1078 follow-up review where the voice picker showed both the raw `4Hm8…` row AND the "Aetheron Australian (default)" row when the assistant was on the platform default (§44), and the same picker silently overwrote a custom voice override on submit because it never detected the override (§45). Normalize-on-read + denormalize-on-write fixes the duplicate row; an `isCustomVoiceId` guard switches the picker to read-only when an override exists (May 2026).
+- Rule §46 added after PR #1116 (`fix/sms-toggle-stale-rollback`), where the optimistic-toggle `onError` callback captured a stale `initial` value and rolled back to the wrong state after two failed attempts. Switched to a `useEffect([serverState])` mirror so the server is the single source of truth and rollback flows through the same path as happy-path resync (May 2026).
+- Rule §47 added after PR #1110 (`fix/sentry-test-env-leak`), where a `sentry.client.config.test.ts` mutation of `process.env.NEXT_PUBLIC_DEPLOYMENT_ENV` leaked into a sibling test file run minutes later, asserting prod-only Sentry behaviour in dev tests. Added the snapshot-and-restore pattern (or `vi.stubEnv` + `vi.unstubAllEnvs` for Vitest ≥1) (May 2026).
 
 When new recurring reviewer comments appear on future PRs, extend this file rather than fixing the symptom once.

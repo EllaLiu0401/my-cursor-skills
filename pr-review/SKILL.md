@@ -172,6 +172,27 @@ When a PR touches `sentry.client.config.ts` / `sentry.server.config.ts` / `Sentr
 - **Replay coupling documentation**: `beforeSend` returning `null` discards the on-error replay too, even with `replaysOnErrorSampleRate: 1`. Require an inline comment so the next reader doesn't assume replay survives.
 - **Engine-agnostic constant naming**: When a regex covers multiple browsers (`Failed to fetch` Chromium + Firefox, `Load failed` Safari), name it `TRANSIENT_FETCH_FAILURE`, not `CHROMIUM_FETCH_FAILURE`.
 - **Canary sampling math**: `2 ** 32` reads better than `0x100000000` and avoids the off-by-one of `0xFFFFFFFF` (which maps the max sample to exactly 1.0).
+- **Framework-internal class anchoring**: Filters that match `error.name === 'ResponseAborted'` (Next.js) / `BailoutToCSRError` / `FST_ERR_VALIDATION` (Fastify) must comment the verified framework version. No semver stability on internal types — silent no-op on major bumps. See `sentry-observability` Rule 11 (PR #1110).
+- **No 100% blackout on lifecycle errors**: For "expected noise" classes (`ResponseAborted`, `Failed to fetch`, `AbortError`), `beforeSend` must keep at least a 1% canary so infra-anomaly volume signals (keep-alive misconfig, ALB idle-timeout drift, CORS regressions) survive. See `sentry-observability` Rule 12.
+- **Scrub before sample/branch**: Header / body scrubbing in `beforeSend` runs at the TOP of the function, before any sampling or filter branch. Otherwise the 1% canary leaks Authorization tokens. See `sentry-observability` Rule 13.
+- **Runtime symmetry or YAGNI**: Filter additions in client config must have matching server-side filters (or a documented asymmetry) — and vice versa. Don't add edge-runtime filters when no edge routes exist. See `sentry-observability` Rule 14.
+- **Pass-through (negative) test fixture**: Every `beforeSend` filter test must include at least one event that survives the filter. Positive-only tests pass when the matcher silently breaks (regex typo, framework rename). See `sentry-observability` Rule 15.
+
+### Global Error Handler Patterns
+
+When a PR touches `QueryProvider.tsx`, any `useActionErrorHandler`-style hook, `MutationCache.onError` / `QueryCache.onError`, or global toast helpers, also apply the patterns in the dedicated **`frontend-error-handling`** skill:
+
+- **Classification ladder**: Global handlers must early-return per error class (transient network → typed `ApiErrorWrapper` → unknown). The unknown branch is the only one that fires `Sentry.captureException` + the generic `internal_error` toast. A flat capture-everything handler makes Sentry volume signals useless. See `frontend-error-handling` §1 (PR #1069).
+- **Narrow `isTransientNetworkError`**: Predicate must combine `instanceof TypeError|DOMException` with the `is-network-error` library + explicit DOMException name check. Plain `error instanceof TypeError` silently downgrades real "cannot read properties of null" bugs to network-blip toasts. See §2.
+- **Toast cooldown**: Per-category 5 s cooldown (module-level Map keyed on classification, not message) prevents spam during multi-query offline scenarios. See §3.
+- **Server flag → client Provider**: Feature flags resolved server-side must reach client components via Provider, not be re-resolved client-side with hardcoded fallbacks. SSR/CSR divergence is invisible in unit tests. See §4 (PR #1072).
+
+### API Response Mappers / Multi-Turn Capture
+
+When a PR touches API response mappers or agent-runner code, also check `backend-db-conventions`:
+
+- **Strip null JSONB before serialization**: `fast-json-stringify` can emit `{}` for runtime `null` JSONB values, which the FE then mis-reads as "feature enabled". Mapper must explicitly skip `null` keys, or the TypeBox schema must declare `Type.Union([..., Type.Null()])` (PR #1116).
+- **Multi-turn agent capture per turn**: Code reading structured tags (`<chat_title>`, citations, telemetry) from agent runs must walk every assistant message during the stream — `result.output` is whatever the final turn was, often a tool call. Use a "last seen wins" comment to document the choice (PR #1071).
 
 ### Cross-Service Data Consistency
 

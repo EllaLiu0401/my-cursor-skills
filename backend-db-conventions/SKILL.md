@@ -108,6 +108,82 @@ if (typeof parsed === 'object' && parsed !== null) {
 
 When resurrecting a soft-deleted row, always **merge** metadata (spread existing + incoming), never overwrite. Critical fields like `slackAppId` in metadata are needed for cleanup flows. Overwriting creates unrecoverable orphans.
 
+## API mappers & runtime patterns
+
+Backend code that doesn't strictly write to the DB but lives in the same `apps/api` / `apps/workloads` boundary.
+
+### Strip null JSONB fields in API response mappers
+
+Frontend code commonly does truthy checks like `if (config.smsConfig)` to render a section conditionally. When the backend column is JSONB and the row's value is genuinely `null` (feature disabled), the mapper must keep `null` distinct from `{}` on the wire — but `fast-json-stringify` (Fastify's default serializer) emits `{}` for any object schema even when the runtime value is `null`, depending on schema shape.
+
+**Anti-pattern (PR #1116):**
+```ts
+// hotel-config-mapper.ts
+export function mapHotelConfig(row: HotelRow): HotelConfigDto {
+  return {
+    id: row.id,
+    name: row.name,
+    smsConfig: row.smsConfig,            // null on disabled rows
+    bookingConfig: row.bookingConfig,    // null on disabled rows
+  };
+}
+// Wire output: { ..., smsConfig: {}, bookingConfig: {} } — UI thinks both are enabled.
+```
+
+**Fix — strip null fields explicitly before serialization:**
+```ts
+export function mapHotelConfig(row: HotelRow): HotelConfigDto {
+  const dto: HotelConfigDto = { id: row.id, name: row.name };
+  if (row.smsConfig !== null) dto.smsConfig = row.smsConfig;
+  if (row.bookingConfig !== null) dto.bookingConfig = row.bookingConfig;
+  return dto;
+}
+```
+
+**Or — use a TypeBox schema with explicit `nullable: true`** so fast-json-stringify preserves `null`:
+```ts
+const HotelConfigDto = Type.Object({
+  id: Type.String(),
+  name: Type.String(),
+  smsConfig: Type.Union([SmsConfig, Type.Null()]), // tells the serializer "real null is valid"
+});
+```
+
+**Apply when:** any API response mapper returning a nullable JSONB / object column. The fast-json-stringify quirk shows up as silent UI bugs that look like backend-side feature flags being wrong.
+
+**Test it:** unit-test the mapper with a `null` field and assert the serialized JSON either omits the key or contains literal `null` — never `{}`. A round-trip `JSON.stringify(mapHotelConfig(row))` test catches this regardless of serializer config.
+
+### Multi-turn agent runs: capture structured tags during the stream, not from `result.output`
+
+In agent-runner / chat-orchestration code, structured payloads (e.g. `<chat_title>...</chat_title>`, `<reasoning_tag>`) may appear in any assistant turn. The final `result.output` is whatever the last turn emitted — typically a tool call or a wrap-up summary, not the original tagged content.
+
+**Anti-pattern (PR #1071):**
+```ts
+const result = await runAgent(job);
+const chatTitle = extractChatTitle(result.output); // null when title was set in turn 1 but turn 3 was a tool call
+```
+
+**Fix — walk every assistant message during/after the stream:**
+```ts
+let streamedChatTitle: string | null = null;
+
+for (const message of sdkMessages) {
+  if (message.role !== 'assistant') continue;
+  const content = typeof message.content === 'string' ? message.content : '';
+  if (content.includes('<chat_title>')) {
+    // "last seen wins" — if multiple turns emit a title, the most recent one is the agent's
+    // final intent. This is a deliberate choice; document it so future debuggers know.
+    streamedChatTitle = extractChatTitle(content);
+  }
+}
+
+const chatTitle = streamedChatTitle ?? extractChatTitle(result.output);
+```
+
+**Apply when:** any code that pulls structured signals (titles, citations, debug flags, telemetry tags) out of agent / streaming output. `result.output` alone is wrong for any multi-turn scenario.
+
+**Test it:** fixture with three turns where the title appears in turn 1, a tool call in turn 2, and a summary in turn 3. Assert the title is captured. Add a "last seen wins" fixture where turns 1 and 3 both emit titles — assert turn 3's wins.
+
 ## Key References
 
 - `planning/db-conventions.md` — full DB conventions (source of truth)
@@ -117,3 +193,5 @@ When resurrecting a soft-deleted row, always **merge** metadata (spread existing
 
 - PG ENUM rules derived from `AGENTS.md` and `planning/db-conventions.md`.
 - JSONB handling, `as`-assertion ban, and metadata merge rules added after PR #919 (`feat/composio-org-level-sync`), where `typeof existing !== 'string'` silently skipped metadata merge for Kysely-sourced JSONB objects, losing `slackAppId` during tombstone resurrection (Apr 2026).
+- "Strip null JSONB fields in API response mappers" added after PR #1116 (`fix/hotel-sms-toggle-state-source-of-truth`), where the FE rendered the SMS section as enabled because the API mapper let fast-json-stringify serialize `null` JSONB fields as `{}` (May 2026).
+- "Multi-turn agent runs: capture per turn" added after PR #1071 (`fix(workloads): persist chat title from any assistant turn (VP-199)`), where `extractChatTitle(result.output)` returned `null` whenever the title appeared in an early turn and a later turn was a tool call (May 2026).
