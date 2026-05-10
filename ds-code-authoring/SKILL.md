@@ -78,11 +78,33 @@ className='btn btn-ghost border border-base-300'
 
 ### `cursor-not-allowed` on Parent Labels
 
-When a `<label>` sets `cursor-not-allowed` (for disabled state), it bleeds onto all children, including nested clickable buttons. If a child button should remain clickable, add `cursor-pointer` directly on it.
+When a `<label>` sets `cursor-not-allowed` (for disabled state), it bleeds onto all children, including nested clickable buttons. If a child button should remain clickable, add `cursor-pointer` directly on it. See agent.md "Cursor Rules" for the full cursor spec.
 
 ### DaisyUI Shared CSS Variables
 
 Changing `--radius-*`, `--size-*`, `--border`, `--depth`, or `--noise` in theme files affects multiple DaisyUI components. Always check consumers in `node_modules/daisyui/components/` before modifying.
+
+## Cursor Rules (see agent.md "Cursor Rules" for full spec)
+
+**Required only on custom clickable elements.** DaisyUI base classes (`.btn`, `.tab`, `.swap`, `.checkbox`, `.radio`, `.toggle`, `.input`, `.select`, `.textarea`, `.range`, `.rating > input`) already set `cursor: pointer` — do not duplicate.
+
+Native `<button>` defaults to `cursor: default`, NOT `pointer`. Raw `<button>` without `.btn` still needs `cursor-pointer`.
+
+```tsx
+// ✅ Custom button (no .btn class)
+<button className={clsx('p-2 rounded-md cursor-pointer disabled:cursor-not-allowed', className)} />
+
+// ✅ Clickable div (custom card, summary, etc.)
+<div onClick={handle} className='cursor-pointer'>...</div>
+
+// ❌ Don't duplicate — .btn already sets cursor: pointer
+<button className='btn cursor-pointer' />
+
+// ❌ Don't ship a clickable element without cursor
+<div onClick={handle}>...</div>
+```
+
+For disabled states, pair `disabled:cursor-not-allowed` alongside `cursor-pointer` so the same element handles both states declaratively.
 
 ## Storybook Stories
 
@@ -157,3 +179,4 @@ The `Icon` component silently returns `null` for unknown names — no runtime wa
 - [ ] `pnpm lint` passes with zero warnings
 - [ ] `pnpm build` succeeds
 - [ ] DaisyUI class specificity verified (especially `btn-outline` vs `btn-ghost`)
+- [ ] Every custom clickable element has `cursor-pointer` (and `disabled:cursor-not-allowed` if it has a disabled state); no duplication on DaisyUI base classes

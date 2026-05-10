@@ -102,6 +102,7 @@ Only AFTER completing the objective verification above, categorize each comment:
 - [ ] Does the codebase already have a pattern we should follow?
 - [ ] Does AGENTS.md or a planning doc have a relevant rule?
 - [ ] **Does the rule apply to this file's scope?** Backend rules (`apps/api/`) don't apply to frontend files (`apps/web/`) and vice versa. E.g., `redirect: 'manual'` for SSRF is a backend concern, not needed in client-side code.
+- [ ] **Terraform IAM organization by mechanism**: If a review asks to move one service permission (e.g., S3 read) to a different Terraform file, check how that task role is audited today. For ECS services using `local.<service>_task_iam_statements` → Fargate `additional_task_iam_statements`, keeping runtime grants together may be clearer than splitting one grant into a managed policy attachment just because the resource is S3. Still update the module README when scopes change.
 - [ ] If deleting a file/export, who imports it? (verify zero external consumers)
 - [ ] If moving code between files, does the function signature stay identical? (no TS breakage)
 - [ ] If changing UI layout, do E2E tests reference moved/removed elements?
