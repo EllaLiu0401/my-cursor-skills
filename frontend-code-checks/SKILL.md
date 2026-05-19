@@ -1193,6 +1193,87 @@ describe('client config', () => {
 
 **Apply when:** any test that reads or writes `process.env`. Especially Sentry config tests, deployment-env tests, feature-flag tests where the env-var resolves the source of truth.
 
+### 48. Legacy URL redirects when deleting/consolidating pages
+
+When deleting page routes during a migration (e.g., merging `/team` + `/organisation` into `/settings`), redirects from old URLs to new ones MUST be added in `next.config.ts` in the same PR. Otherwise bookmarks, links in emails/docs, and browser history all 404.
+
+**Anti-pattern (PR #1208):**
+```tsx
+// Deleted /organisation/page.tsx and /team/page.tsx
+// But no redirects added — old bookmarks now 404
+```
+
+**Fix — add redirects in `next.config.ts`:**
+```tsx
+async redirects() {
+  return [
+    { source: '/team', destination: '/settings?tab=team', permanent: false },
+    { source: '/organisation', destination: '/settings?tab=organisation', permanent: false },
+  ];
+},
+```
+
+Use `permanent: false` (302) for recent migrations where the URL structure may still evolve.
+
+**Apply when:** deleting standalone pages that are being consolidated into a tabbed/unified page, renaming routes, or moving features to a different URL path. Grep for the old path in email templates, Slack notifications, and internal docs to confirm no other consumers.
+
+### 49. Navigation consolidation tests need both positive and negative assertions
+
+When consolidating multiple nav items into one (e.g., Organisation + Team → Settings), the test must verify BOTH that the new item exists AND that the old items are gone. Only checking for the new item doesn't prove consolidation happened.
+
+**Anti-pattern (PR #1208):**
+```tsx
+const settingsLinks = screen.getAllByText('Settings');
+expect(settingsLinks.length).toBeGreaterThan(0);
+// Missing: are "Organisation" and "Team" still rendered?
+```
+
+**Fix — add positive + negative assertions:**
+```tsx
+const settingsLinks = screen.getAllByRole('link', { name: 'Settings' });
+expect(settingsLinks.some((link) => link.getAttribute('href') === '/settings')).toBe(true);
+expect(screen.queryByText('Organisation')).not.toBeInTheDocument();
+expect(screen.queryByText('Team')).not.toBeInTheDocument();
+```
+
+Use `getAllByRole('link')` with href validation instead of `getAllByText` to avoid matching unrelated UI text.
+
+### 50. E2e page objects must track page title and tab navigation changes
+
+When a page's heading changes (e.g., "Team" → "Settings") or gains tabbed navigation, update the e2e page object's `expectLoaded()` and add tab-specific navigation methods. Otherwise e2e flows will silently fail.
+
+**Anti-pattern (PR #1208):**
+```ts
+// SettingsPage.ts — still asserts old heading after page was renamed
+async expectLoaded() {
+  await expect(this.page.getByRole('heading', { name: /team/i })).toBeVisible();
+}
+
+// analyst.setup.ts — navigates to /settings (defaults to Organisation tab)
+// then immediately expects team controls to be visible
+await settings.goto();
+await settings.expectTeamManagementVisible(); // silently fails — wrong tab is active
+```
+
+**Fix — update heading and add tab-aware navigation:**
+```ts
+async expectLoaded() {
+  await expect(this.page.getByRole('heading', { name: /settings/i })).toBeVisible();
+}
+
+async gotoTeamTab() {
+  await this.page.goto('/settings?tab=team');
+}
+```
+
+Then update all callers that need specific tab content to use the tab-aware method.
+
+### 51. `useCallback` with `useSearchParams()` dependency is a no-op
+
+`useSearchParams()` returns a new `URLSearchParams` instance on every render in Next.js App Router. Including `searchParams` in a `useCallback` dep array means the callback is recreated every render — the memoization does nothing.
+
+This is harmless when the callback is only used in inline `onChange` handlers (no child depends on referential identity). Leave as-is to match the existing pattern in `ReportsTabs` / `IntegrationsTabs` — clean up across all tab components at once if ever needed.
+
 ## Before-submission checklist
 
 Copy this at the end of a frontend task:
@@ -1249,6 +1330,9 @@ Frontend checks:
 - [ ] Optimistic toggles drive auto-rollback off `useEffect([serverState])`, not stale-closure `onError` callbacks
 - [ ] Tests that mutate `process.env` snapshot in `beforeEach` and restore (or `delete`) in `afterEach` — never leave env mutations leaking across files
 - [ ] Global error handlers / network-error predicates / toast cooldowns / server→client feature-flag plumbing follow the dedicated `frontend-error-handling` skill
+- [ ] When deleting/consolidating page routes, legacy URL redirects added in `next.config.ts` (no dangling 404s for bookmarks)
+- [ ] Navigation consolidation tests have both positive (`Settings` link with correct href) AND negative (`Organisation`/`Team` not in document) assertions
+- [ ] E2e page object `expectLoaded()` matches the current page heading; tab-specific `gotoXTab()` methods added when page gains tabbed navigation
 - [ ] `pnpm turbo run typecheck --filter=@aetheronhq/web` PASS
 - [ ] `pnpm turbo run lint --filter=@aetheronhq/web` PASS
 - [ ] `pnpm turbo run test --filter=@aetheronhq/web` PASS
@@ -1271,5 +1355,7 @@ Frontend checks:
 - Rules §44–§45 added after PR #1078 follow-up review where the voice picker showed both the raw `4Hm8…` row AND the "Aetheron Australian (default)" row when the assistant was on the platform default (§44), and the same picker silently overwrote a custom voice override on submit because it never detected the override (§45). Normalize-on-read + denormalize-on-write fixes the duplicate row; an `isCustomVoiceId` guard switches the picker to read-only when an override exists (May 2026).
 - Rule §46 added after PR #1116 (`fix/sms-toggle-stale-rollback`), where the optimistic-toggle `onError` callback captured a stale `initial` value and rolled back to the wrong state after two failed attempts. Switched to a `useEffect([serverState])` mirror so the server is the single source of truth and rollback flows through the same path as happy-path resync (May 2026).
 - Rule §47 added after PR #1110 (`fix/sentry-test-env-leak`), where a `sentry.client.config.test.ts` mutation of `process.env.NEXT_PUBLIC_DEPLOYMENT_ENV` leaked into a sibling test file run minutes later, asserting prod-only Sentry behaviour in dev tests. Added the snapshot-and-restore pattern (or `vi.stubEnv` + `vi.unstubAllEnvs` for Vitest ≥1) (May 2026).
+
+- Rules §48–§51 added after PR #1208 (`AP-491/settings-tabbed-navigation`), where: (§48) deleting `/organisation/page.tsx` and `/team/page.tsx` without adding redirects left old bookmarks/links returning 404 — fixed by adding `permanent: false` redirects in `next.config.ts`; (§49) the AppLayout test only checked `getAllByText('Settings')` without asserting the old `Organisation` / `Team` nav items were gone — switched to `getAllByRole('link')` with href validation + negative assertions; (§50) e2e `SettingsPage.expectLoaded()` still matched `/team/i` after the page title changed to "Settings", and `goto()` defaulted to the Organisation tab so team-related e2e flows silently failed — added `gotoTeamTab()` and updated callers; (§51) `useCallback` with `useSearchParams()` in deps is a no-op since `useSearchParams()` returns a new instance each render — documented as harmless, matches existing tab patterns (May 2026).
 
 When new recurring reviewer comments appear on future PRs, extend this file rather than fixing the symptom once.

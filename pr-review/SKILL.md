@@ -12,7 +12,22 @@ description: >-
 
 ## Overview
 
-End-to-end PR review: understand changes → check compliance → deduplicate against existing comments → post inline comments to GitHub.
+End-to-end PR review: understand business context → validate business flow → evaluate approach → check code → deduplicate with ROI filter → post inline comments to GitHub.
+
+## Step 0: Business Context Gate
+
+**Before reading any code**, establish the business context. A PR review without understanding the business problem is guesswork.
+
+1. **Read the PR description + linked Jira/task spec.** Can you answer these three questions?
+   - What business problem does this solve? (What was broken, missing, or inefficient?)
+   - Who is affected? (End users, operators, internal team, on-call?)
+   - What does "done" look like? (Acceptance criteria, expected user experience change)
+
+2. **If the business context is unclear, stop.** Flag as P1 blocker and request clarification before proceeding to code review. A vague or absent PR description is the first red flag — not a minor issue to note at the end.
+
+3. **Extract acceptance criteria** to validate against later. When evaluating the code, every behavioral change should map back to a stated business goal.
+
+This is the highest-value step. A PR that solves the wrong business problem or implements an incorrect business flow needs to be caught here, not after 30 inline comments on code style.
 
 ## Step 1: Gather Context
 
@@ -52,7 +67,24 @@ Collect all inputs in parallel:
 - All existing reviewer comments (who said what, on which file:line)
 - Author's response/triage comment (often marks issues as "pre-existing" or "addressed")
 
-## Step 2: Analyze the PR
+## Step 2: Validate Business Flow
+
+Before diving into code quality, validate that the PR implements the **right business flow**.
+
+**1. Map the PR to the user journey.**
+Trace the change through: user action → system behavior → outcome. Does the flow make sense from the user's perspective? Is there a simpler path to the same business goal?
+
+**2. Check for business flow correctness.**
+Business flow issues have the highest impact — they can require a complete rewrite. Watch for:
+- **Blind spots** — even experienced engineers can miss edge cases in flows they rarely touch
+- **Narrow thinking** — the happy path works, but what about cancellations, partial failures, retries, or concurrent users?
+
+**3. When the business flow is wrong, flag it immediately.**
+Don't proceed to code-level review if the flow itself is incorrect or significantly inefficient. A perfectly coded implementation of the wrong flow is worse than a rough implementation of the right one. Frame it constructively: "The implementation is clean, but I think the business flow has an issue — here's what the user would actually experience."
+
+When business flow concerns exist, they take priority over everything else.
+
+## Step 3: Analyze the PR
 
 ### Foundational Review Principles
 
@@ -88,6 +120,34 @@ A review that pads findings with noise erodes trust. Before posting a comment, a
 - **Nitpicks must be labeled as such** — use `[NITPICK]` or P3 so the author knows it's optional.
 - **Don't flag theoretical risks with no practical exploit path** — "if someone passes negative infinity here" is not useful unless the input is user-controlled.
 - **Positive verification is part of a thorough review** — marking verified-safe patterns (e.g., "SECURITY VERIFIED — tenant isolation holds because ScopedDb always applies orgId filter", "CHAIN VERIFIED — delete flow has layered ownership checks") shows the review was rigorous, not just looking for problems.
+
+---
+
+### Approach-Level Review (before diving into code details)
+
+Before examining individual files, evaluate the PR holistically:
+
+**1. Is the problem clearly defined?**
+Read the PR description and linked issue/task. If the PR doesn't articulate what problem it's solving, flag it immediately — code review without a clear problem statement is guesswork. A good PR description answers: what was broken or missing, who it affects, and what "done" looks like. If the description is vague or absent, request clarification before investing in line-by-line review.
+
+**2. Is this the best approach, or just one that works?**
+"It works" is necessary but not sufficient. Ask:
+- Is this treating the **root cause** or just suppressing a **symptom**? (E.g., adding a null-check where the real fix is ensuring the value is never null upstream.)
+- Is there a simpler, more direct solution? (Per AGENTS.md: "Minimalistic — every line of code is a liability.")
+- Does this follow the existing architecture, or does it introduce a parallel pattern that will need reconciliation later?
+- Would the approach scale if the same problem appears in 5 more places?
+
+**3. What are the trade-offs?**
+Every non-trivial change has costs. Evaluate:
+- **Complexity cost**: Does this introduce new abstractions, indirection layers, or special cases? Are they justified?
+- **Maintenance burden**: Will the next developer understand why this was done this way? Does it create implicit coupling that's easy to break?
+- **Dependency growth**: Does it pull in new libraries or tighten coupling to external services?
+- **Scope creep**: Does the PR do more than it claims? Unrelated changes should be in a separate PR.
+
+**4. When the approach is fundamentally wrong, say so.**
+If the PR is locally correct but structurally misguided — wrong abstraction layer, wrong data model, solving the wrong problem — don't just leave P2 nitpicks and approve. Flag it as P1 with a concrete alternative direction. A clean rewrite of a small PR is cheaper than maintaining a bad abstraction for years. Frame it constructively: "The code itself is clean, but I think the approach has a structural issue — here's what I'd suggest instead."
+
+When approach-level concerns exist, they take priority over code-level findings. A perfectly written implementation of the wrong approach is still the wrong approach.
 
 ---
 
@@ -262,6 +322,10 @@ When a PR touches API response mappers or agent-runner code, also check `backend
 - **Shared mutation hook test coverage**: When a PR extracts a shared hook from two callers (e.g. `useGenerateWeeklyReport` factored out of `GenerateReportModal` + `WeeklyReportViewer`), grep the test files for `renderHook(() => theNewHook(`. Both callers almost always `vi.mock` the hook entirely so the hook's own toast / invalidate / conflict-vs-generic logic has zero coverage. Require a dedicated `renderHook` test covering happy path, the conflict / domain-error branch (with `vi.spyOn(queryClient, 'invalidateQueries')` to assert the soft-success path), generic error (no invalidate, no callback, error propagates), and the no-callback default (PR #1068).
 - **`router.refresh()` redundant alongside `invalidateQueries`**: `router.refresh()` re-runs the parent server component (with all its `await` data fetches) AND `invalidateQueries` re-fetches the React Query data — double work. Decide based on data ownership: server-fetched (`page.tsx` `await listX(...)`) → `router.refresh`; React Query (`useX` hook) → `invalidateQueries`. Flag any `onSuccess` that calls both (PR #1068).
 
+- **Legacy URL redirects on page deletion/consolidation**: When a PR deletes standalone page routes and consolidates them (e.g., `/team` + `/organisation` → `/settings?tab=team` + `/settings?tab=organisation`), verify that `next.config.ts` has `redirects()` entries for the old paths. Missing redirects break bookmarks, email links, and browser history. Use `permanent: false` (302) for fresh consolidations. Flag as P1 if no redirects exist (PR #1208).
+- **Navigation consolidation test completeness**: When nav items are consolidated (e.g., two sidebar entries → one), the nav layout test must assert both the new item (link with correct `href`) AND the removal of old items via negative assertions (`queryByText('OldItem').not.toBeInTheDocument()`). Using `getAllByText` without href validation can match unrelated UI text. Flag if negative assertions are missing (PR #1208).
+- **E2e page object heading and tab-navigation alignment**: When a PR changes a page heading (e.g., "Team" → "Settings") or adds tabbed navigation, the e2e page object's `expectLoaded()` must match the current heading, and tab-specific navigation methods (e.g., `gotoTeamTab()`) must exist for e2e flows that target a specific tab. Without this, e2e flows silently land on the wrong tab and fail downstream assertions. Check all callers of `goto()` that depend on a specific tab's content being visible (PR #1208).
+
 ### Frontend Performance & State
 
 - **Conditional rendering of inactive content**: Tab contents passed as ReactNode props mount and compute even when hidden. Conditionally render only the active tab's children to avoid unnecessary work as data grows.
@@ -321,6 +385,8 @@ When a PR touches API response mappers or agent-runner code, also check `backend
 - **Route handler catch-branch coverage**: When a route handler adds a `try/catch`, tests must exercise BOTH the catch branch (mock fetch to throw the expected error class — e.g., `new DOMException('aborted', 'AbortError')`) AND the re-throw path (mock fetch to throw a non-matching error, assert `await GET(...)` rejects with the same error). The re-throw test is what catches the race-condition regression: without it, a future refactor that widens the catch discriminator silently restores the original bug. Template: `apps/web/src/app/api/csp-report/route.test.ts`.
 - **Real-DB integration tests for migration-coupled code with branched WHERE**: Per AGENTS.md "never mock the database". When a function has a multi-branch `WHERE` guard (e.g. `setAutoTitle` writes IF `title IS NULL OR title_source = 'auto'` and skips when `title_source = 'manual'`), every branch needs a Testcontainers-backed test in the appropriate package (`packages/sessions`, `apps/api/test/integration/`, etc.). The most critical branch is the safety branch (the one that PROTECTS user data) — regression there silently overwrites and only surfaces in production support tickets. Mocking the DB in `agent-runner.test.ts` doesn't substitute (PR #992).
 - **Upstream-request shape coverage in route-handler tests**: Tests that only assert response status leave the upstream call shape untested. Dropping the `Authorization` header, switching `Accept`, or removing `signal: request.signal` would all keep the suite green. Require: positive `expect.objectContaining({ headers, signal })` and, for conditional spreads (`...(lastEventId ? { 'Last-Event-ID': lastEventId } : {})`), a negative assertion (`expect.not.objectContaining({ 'Last-Event-ID': expect.anything() })`) so a refactor to always-include doesn't silently send `null` upstream (PR #1038).
+- **E2e page object drift on page consolidation**: When a PR renames a page or changes its heading, check the e2e page object's `expectLoaded()` assertion. A stale heading regex (e.g., `/team/i` when the page is now "Settings") will fail silently in CI. Also check all e2e test callers: flows that need a specific tab (e.g., team management) must navigate to `?tab=team`, not rely on the default tab (PR #1208).
+- **Navigation test positive + negative coverage**: When a PR consolidates nav items, the layout test must use `getAllByRole('link', { name })` with `getAttribute('href')` validation (not `getAllByText`) AND include `queryByText('OldNavItem').not.toBeInTheDocument()` for removed items. A consolidation test that only asserts the new link exists doesn't prove the old items were removed (PR #1208).
 - **`vi.unstubAllGlobals()` cleanup**: When a test stubs `global.fetch` (or any other global) via `vi.stubGlobal`, expect an `afterEach(() => vi.unstubAllGlobals())`. Vitest's default `isolate: true` makes omission safe today, but explicit cleanup matches the convention in `proxy.test.ts` and `useChat.test.ts` (PR #1038).
 - **Counter-based alternating mocks are fragile**: A `mutateCallIndex++ % 2`-style mock that alternates between two return values silently breaks the moment the component reorders or adds a third hook call. Recommend matching on argument identity (`vi.fn((action) => action === createX ? mockA : mockB)`) so the test stays correct under reorders (PR #869).
 - **Case-insensitive validation and `MAX_*` cap coverage**: When the implementation does `.toLowerCase()` dedup or enforces a numeric cap, both invariants need explicit tests. The implementation is easy to delete in a refactor and the existing tests would still pass on the happy path. Flag missing coverage even when the code looks correct today (PR #869).
@@ -337,7 +403,7 @@ When a PR touches API response mappers or agent-runner code, also check `backend
 
 ### React Anti-patterns
 
-- **Key collision on data-driven lists**: Use `key={\`${index}-${item}\`}` or a unique ID, not the item value itself.
+- **Key collision on data-driven lists**: Use a stable unique ID for `key` (e.g., `key={item.id}`). Avoid using array index as key — it causes subtle bugs when items are reordered, inserted, or deleted. If no stable ID exists, a composite key from unique item properties is acceptable.
 - **Config/data constants don't belong in hook files**: Move shared config to `@/lib/`.
 - **DRY: extract shared hook patterns early**: Same stateful pattern in 2+ files → extract a hook.
 - **Fragile magic strings from LLM output**: Normalize with `.trim().toLowerCase()` and check against a set of known null-ish values.
@@ -359,6 +425,16 @@ For each significant code path introduced or modified, systematically check:
 
 - **Hover-only controls need keyboard support**: Add `aria-label` and `focus-visible:opacity-100` alongside `group-hover:opacity-100`.
 
+### Naming Quality
+
+Unclear or misleading names are a red flag — they often indicate deeper design confusion.
+
+- **Self-explanatory names**: Variables, functions, classes, services, events, and queues should communicate their purpose without requiring the reader to trace the implementation. If you need to read the function body to understand what `processItems` does, the name has failed.
+- **Generic names**: Flag `handleData`, `processItems`, `doStuff`, `manager`, `helper`, `utils` (when used as a class/module name, not a folder) as P3. These names hide the business intent.
+- **Business-domain alignment**: Service and event names should reflect business concepts (`reservationService`, `bookingConfirmedEvent`), not implementation details (`dataProcessor`, `queueHandler`).
+- **Cross-PR consistency**: The same concept must use the same name throughout the PR. If one file calls it `assistant` and another calls it `agent` for the same entity, flag the inconsistency.
+- **Acronym and abbreviation policy**: Spell out domain terms on first use unless they are universally understood in the project (e.g., `org`, `db`, `id` are fine; `rpt` for "report" is not).
+
 ### General Quality
 - Redundant / dead code (including dead fields in types that are computed but never read)
 - Inconsistencies within the PR itself (e.g., using DS `Loading` in one file but raw DaisyUI in another)
@@ -367,7 +443,7 @@ For each significant code path introduced or modified, systematically check:
 - PR description drift — when implementation changes during review, the PR description must be updated to match the final state
 - **Out-of-scope changes**: Flag any file changes unrelated to the PR's stated purpose. Unrelated test refactors, reverted commits from other PRs, or drive-by formatting changes should be in a separate PR. They add review burden and can introduce flaky behavior (e.g., replacing `vi.waitFor` with `setTimeout(0)` in a PR about message persistence).
 
-## Step 3: Deduplicate & Evaluate Pushback
+## Step 4: Deduplicate, Evaluate Pushback & Filter by ROI
 
 Cross-reference findings against existing GitHub comments:
 
@@ -388,6 +464,22 @@ For each issue found:
 
 When the author pushes back and cites evidence (SDK types, actual runtime behavior), accept the pushback. When the author pushes back with speculation, ask for the evidence.
 
+### Comment ROI Filter
+
+Before finalizing the comment list, evaluate the **return on investment** of each comment. The goal is delivering business value, not maximizing the number of findings.
+
+For every P2/P3 finding, ask:
+- **Modification cost**: How many files, tests, and deployments does this change require?
+- **Risk of not changing**: Will this cause a bug, data loss, or user-visible issue? Or is it "not elegant enough"?
+- **Proportionality**: Would this comment bump the task from 3 story points to 8? If so, discuss with the author or flag as a separate backlog item rather than blocking the PR.
+
+**Drop or downgrade comments that fail the ROI test:**
+- A P3 naming suggestion that requires renaming across 10 files + 3 test files → note as "future improvement" in the review body, not an inline comment
+- A theoretical edge case that cannot occur given the current data model → don't post
+- A "would be slightly cleaner if..." that adds no measurable safety or readability → don't post
+
+**Never leave a comment just to fill space.** A review with zero comments and an APPROVE is a valid outcome for a clean PR.
+
 Present a summary table to the user:
 
 | Issue | Already Covered By | Action |
@@ -395,7 +487,7 @@ Present a summary table to the user:
 | ... | reviewer-name | Skip |
 | ... | — | **New → Comment** |
 
-## Step 4: Draft Comments
+## Step 5: Draft Comments
 
 Split findings into two streams:
 - **Inline comments** — real issues only (P1 / P2 / P3). One comment per concern, anchored to the exact line.
@@ -403,14 +495,29 @@ Split findings into two streams:
 
 For each new issue, draft an inline comment following these principles:
 
-### Tone
-- Diplomatic, concise, logical
+### Tone & Psychological Safety
+
+A review comment is never inherently bad — unless it's poorly written. These rules ensure comments are constructive and actionable.
+
+**Language:**
+- Use **"we"** instead of **"you"** — "We could improve this by..." not "You should change this to..."
+- Frame negatives as improvements: "This method can be optimized by X, Y, Z" not "This method is inefficient"
 - Frame as observations/suggestions, not demands
 - Use "worth considering" / "for consistency" / "not blocking" for minor items
+- Offer escape hatch: "happy to address in a follow-up if preferred"
+
+**Evidence & references:**
 - Include the **rule reference** (e.g., "Per `frontend-architecture.md` §4")
 - Include the **evidence** (e.g., "Checked `ScopedDb.selectFrom` at L109 — it already applies the filter")
 - For external API constraints, **cite the docs URL**
-- Offer escape hatch: "happy to address in a follow-up if preferred"
+
+**Actionability:**
+- Every comment must propose a solution or outline possible improvements. Never just write "Improve this" or "This is wrong."
+- If suggesting a change, include a brief code snippet showing the target state
+
+**Volume management:**
+- When finding **8+ issues**, add a note in the review body suggesting a synchronous discussion: "This PR has several structural concerns — a quick sync call might be more efficient than inline comments."
+- If the PR has fundamental issues, prefer a direct conversation over 20 inline comments. A call saves time and allows real-time feedback.
 
 ### Format
 - **Bold tag** at the start: `**DS component consistency**`, `**DRY**`, `**Race condition**`, `**Behavioral change**`, `**Operational impact**`, `**Data consistency**`
@@ -444,19 +551,41 @@ This keeps the file diff focused on actionable comments while still demonstratin
 - P2: Should fix, may defer with justification (correctness, consistency)
 - P3: Suggestion / nice-to-have (DRY, naming, follow-up improvements)
 
-## Step 5: Post to GitHub
+## Step 6: Determine Review Verdict & Post to GitHub
 
-Post all comments as a single review via `gh api`:
+### Verdict Rules
+
+Choose the review event based on the highest-severity finding:
+
+| Highest severity in findings | `event` value | Meaning |
+|------------------------------|---------------|---------|
+| **P1** (must fix before merge) | `REQUEST_CHANGES` | Blocks merge until addressed |
+| **P2 only** (no P1s) | `COMMENT` | Issues worth fixing but not blocking |
+| **P3 only (1-3) or no issues** | `APPROVE` | Ship it (mention P3 suggestions inline) |
+| **Many P3s (4+)** | `COMMENT` | Pattern of minor issues suggests a sync discussion |
+
+Include the verdict rationale in the review body summary, e.g.:
+- `REQUEST_CHANGES`: "Two P1 blockers must be resolved before merge."
+- `COMMENT`: "No blockers — three P2 suggestions worth addressing."
+- `APPROVE`: "Clean PR, no issues found. Ship it."
+- `APPROVE` with P3s: "Approving — a few minor suggestions inline, none blocking."
+
+### Post all comments as a single review via `gh api`:
 
 ```bash
 # 1. Get head commit SHA
 COMMIT=$(gh api repos/{owner}/{repo}/pulls/{number} --jq '.head.sha')
 
-# 2. Create review with all inline comments
+# 2. Determine event based on findings (set one of: REQUEST_CHANGES, COMMENT, APPROVE)
+EVENT="APPROVE"  # default when no issues
+# EVENT="COMMENT"  # when P2-only findings exist
+# EVENT="REQUEST_CHANGES"  # when any P1 finding exists
+
+# 3. Create review with all inline comments
 gh api repos/{owner}/{repo}/pulls/{number}/reviews \
   --method POST \
   --field commit_id="$COMMIT" \
-  --field event="COMMENT" \
+  --field event="$EVENT" \
   --field 'body=Review summary text' \
   --input - <<'PAYLOAD'
 {
@@ -471,21 +600,28 @@ gh api repos/{owner}/{repo}/pulls/{number}/reviews \
 }
 PAYLOAD
 
-# 3. If review lands as PENDING, submit it:
+# 4. If review lands as PENDING, submit it:
 gh api repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/events \
   --method POST \
-  --field event="COMMENT" \
+  --field event="$EVENT" \
   --field 'body=Review summary'
 ```
 
 **Line numbers**: Use the actual file line number (not diff line), with `"side": "RIGHT"` for additions.
 
-**Review body**: Keep it neutral, no personal signatures. Structure:
+**Special characters in comment bodies**: If comment text contains single quotes, backticks, or the literal string `PAYLOAD`, the HEREDOC approach can break. In that case, write the full JSON payload to a temp file and use `--input /tmp/review-payload.json` instead of piping via HEREDOC.
+
+**Review body**: Keep it neutral, no personal signatures. The opening sentence must state the verdict clearly. Structure:
 
 ```
 ## [Topic] Review
 
-[1-3 sentence summary of what was checked and the overall verdict.]
+[Verdict line — must match the event type:]
+- REQUEST_CHANGES: "Requesting changes — N P1 blocker(s) must be resolved before merge."
+- COMMENT: "No blockers — N suggestions/issues worth addressing."
+- APPROVE: "Looks good — approving. [Optional: N minor suggestions inline.]"
+
+[1-3 sentence summary of what was checked.]
 
 ## Issues
 
@@ -496,13 +632,11 @@ gh api repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/events \
 - **[Category]** — [what was checked] matches [code reference].
 - **[Category]** — [what was checked] matches [code reference].
 - ...
-
-[Optional closing — e.g. "No blockers" / "Two P1s worth fixing before merge".]
 ```
 
 The `## Verified` block is where positive verifications live — never inline.
 
-## Step 6: Verify
+## Step 7: Verify
 
 After posting, verify comments are visible:
 
@@ -513,51 +647,85 @@ gh api repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/comments \
 
 ## Checklist
 
-Before posting, confirm:
+Grouped by domain. **Skip sections that don't apply to the PR's scope.**
+
+### Pre-Review (always)
+- [ ] **Business context understood**: Can answer what problem this solves, who is affected, and what "done" looks like
+- [ ] **Business flow validated**: Changes mapped to user journey; flow is intuitive and simplest path to the business goal
+- [ ] **Approach evaluated**: The fix addresses root cause, not just symptoms. No simpler/more direct alternative was overlooked.
+- [ ] **Trade-offs assessed**: Complexity cost, maintenance burden, dependency growth, and scope creep evaluated
+- [ ] **Structural soundness**: If approach is fundamentally wrong, flagged as P1 with alternative direction
 - [ ] AGENTS.md was read and all applicable rules were checked
 - [ ] Relevant planning docs were read based on PR scope
-- [ ] All claims are evidence-based (real code/types verified, not assumed)
-- [ ] External API constraints verified via docs (URLs cited where applicable)
-- [ ] User/operator experience traced for all behavioral changes
-- [ ] Edge cases systematically checked (empty, null, zero, max, duplicates) for each new code path
-- [ ] **Variable value-domain changes traced**: For each variable whose possible values changed (new null path, new conditional, dedup skip), all downstream consumers in the same function/module were checked
-- [ ] **New branch paths checked for side-effect gaps**: Every new if/else, dedup, or early return was traced for bypassed side effects (metadata, timestamps, counters)
-- [ ] **React hydration/persistence effects checked**: Effect deps are true trigger values, self-canceling state writes are not deps, PENDING paths reach READY, and cancelled loads cannot strand `hydrating`
-- [ ] **Catch-block discriminators use error shape, not global state**: Fetch abort catches discriminate via `err instanceof DOMException && err.name === 'AbortError'`, not `signal.aborted`. Route handler try/catch has tests covering BOTH the catch branch AND the re-throw path.
-- [ ] **Test names match assertions**: Each new test's name accurately describes what the mock data + assertions actually verify
 - [ ] **No out-of-scope changes**: All modified files relate to the PR's stated purpose
+- [ ] All claims are evidence-based (real code/types verified, not assumed)
+- [ ] Edge cases systematically checked (empty, null, zero, max, duplicates) for each new code path
+- [ ] **Naming quality**: Variables, functions, services are self-explanatory; no generic names; consistent terminology across the PR
+
+### Backend (skip if frontend-only PR)
+- [ ] Route → Service → Repository layering (routes never import repositories directly)
+- [ ] TypeBox schemas, typed errors, OpenAPI coverage for all new endpoints
+- [ ] Database: composite PKs, RLS, UUIDv7, `.limit()` on all list queries, `request.db()` in routes
 - [ ] **Specialized helper preference checked**: `withSystemDb` callers audited for whether `withBootstrapSystemDb` (or other more specific helper) applies
-- [ ] **Append-then-write retry safety verified**: Jobs that `appendEvent` then `withScopedDb` have idempotent guards (`.catch(log.warn)`) to survive SQS retries
-- [ ] **Buffer-then-flush patterns flagged for centralization or AC tightening** when the planning doc mandates centralized SDK fan-out
-- [ ] **Output marker stripping consistent across SSE / persistence paths**
+- [ ] **Variable value-domain changes traced**: For each variable whose possible values changed, all downstream consumers checked
+- [ ] **New branch paths checked for side-effect gaps**: Every new if/else, dedup, or early return traced for bypassed side effects
+- [ ] **Catch-block discriminators use error shape, not global state**: `err instanceof DOMException && err.name === 'AbortError'`, not `signal.aborted`
+- [ ] **Append-then-write retry safety verified**: Jobs that `appendEvent` then `withScopedDb` have idempotent guards
+- [ ] **Buffer-then-flush patterns flagged** for centralization when planning doc mandates centralized SDK fan-out
+- [ ] **Output marker stripping consistent** across SSE / persistence paths
 - [ ] **`logger.warn` reviewed against Sentry threshold** — user-visible content failures use `logger.error` or explicit `Sentry.captureException`
-- [ ] **Real-DB integration tests** present for migration-coupled functions with branched WHERE guards (especially the safety branch)
 - [ ] **OpenAPI nullable columns use `required` + `T | null`**, not `Optional`, unless absence is semantically distinct from null
 - [ ] **`?? null` redundancy removed** on `kysely-codegen` `T | null` fields
-- [ ] **Server Components don't accept `t` / `formatDate` / `format` callbacks as props** — they call `getTranslations()` / `getFormatter()` directly
+- [ ] **SDK parameters verified against actual Zod schema** in `node_modules`
+- [ ] **JSONB column handling verified**: handles both object (DB read) and string (`JSON.stringify`) inputs
+- [ ] External API constraints verified via docs (URLs cited where applicable)
+
+### Frontend (skip if backend-only PR)
+- [ ] DS compliance: all standard UI elements use `@aetheronhq/ui` components
+- [ ] Server Components by default; `'use client'` only when truly needed
+- [ ] All text via `next-intl` (no hardcoded strings)
+- [ ] **Server Components don't accept `t` / `formatDate` / `format` callbacks as props**
 - [ ] **Paired containers (loading / error / empty / content) share identical className shape**
 - [ ] **`Intl.DateTimeFormat` calls receive an explicit locale**, never `undefined`
-- [ ] **Sentry `beforeSend` filter audited** for tag-aware bypass coverage on all explicit captures and replay-coupling documentation
-- [ ] **Date-only string rendering** uses `timeZone: 'UTC'` (or splits y/m/d explicitly) — flag every render site, not just the first
+- [ ] **Date-only string rendering** uses `timeZone: 'UTC'` (or splits y/m/d explicitly)
 - [ ] **`useMemo` of "current time"** is recomputed in modal-open effects, not snapshot at mount
-- [ ] **Every `useQuery` / `useMutation`** has explicit `retry`, `staleTime`, `meta.suppressGlobalError` choices verified safe under polling × retry × N-viewer multiplication
-- [ ] **`meta.suppressGlobalError`** is honoured by both `QueryCache.onError` AND `MutationCache.onError` in `QueryProvider`
-- [ ] **Status-enum branches** include a `default` arm with a placeholder fallback, regression-tested with a fictional status value
+- [ ] **Every `useQuery` / `useMutation`** has explicit `retry`, `staleTime`, `meta.suppressGlobalError` choices
+- [ ] **`meta.suppressGlobalError`** honoured by both `QueryCache.onError` AND `MutationCache.onError`
+- [ ] **Status-enum branches** include a `default` arm with placeholder fallback
 - [ ] **Empty-string content** discriminated via `typeof === 'string'`, not `if (data)`
 - [ ] **Single-record lookups** use `getX({ id })`, not `listX({ limit: 100 })`
-- [ ] **Mutation error branches** satisfy the three-thing rule: user feedback + Sentry capture + recovery path (e.g. 409 must invalidate, not just toast)
-- [ ] **Shared mutation hook** has its own `renderHook` test — happy / domain-error / generic / no-callback paths
+- [ ] **Mutation error branches** satisfy three-thing rule: user feedback + Sentry capture + recovery path
+- [ ] **Shared mutation hook** has its own `renderHook` test
 - [ ] **No `router.refresh()` alongside `invalidateQueries`** for the same data
+- [ ] **Legacy URL redirects present** when pages are deleted/consolidated
+- [ ] **React hydration/persistence effects checked**: Effect deps are true trigger values, self-canceling state writes are not deps
+
+### Sentry & Observability (skip if no Sentry/logging changes)
+- [ ] **Sentry `beforeSend` filter audited** for tag-aware bypass coverage and replay-coupling documentation
+- [ ] See dedicated `sentry-observability` skill for full checklist
+
+### Testing (always for PRs with code changes)
+- [ ] New endpoints have integration tests (happy path, empty, 404, 403, tenancy isolation)
+- [ ] **Test names match assertions**: Each test's name matches what the mock data + assertions actually verify
+- [ ] **Real-DB integration tests** present for migration-coupled functions with branched WHERE guards
+- [ ] **E2e page objects match current headings**; tab-specific `gotoXTab()` methods exist for tabbed pages
+- [ ] **Navigation consolidation tests have negative assertions** for removed items
+- [ ] Route handler catch-branch coverage: tests exercise BOTH the catch branch AND the re-throw path
+
+### Infra / Terraform (skip if no infra changes)
+- [ ] Module README updated when changing variables/resources/scopes
+- [ ] No manual AWS console steps — all resources provisioned by Terraform
+
+### Post-Review (always)
+- [ ] **Comment ROI assessed**: Every P2/P3 comment is worth the author's time to fix
+- [ ] **Tone is constructive**: Uses "we" not "you"; frames negatives as improvements
+- [ ] **Volume check**: If 8+ issues, review body suggests a sync call
 - [ ] No manufactured issues — every inline comment addresses a real concern (P1/P2/P3)
-- [ ] **Inline comments are issues only** — no `**VERIFIED**` / `**SECURITY VERIFIED**` etc. inline. Positive verifications go in the review body's `## Verified` block.
-- [ ] Verified-safe patterns recorded in the review body's `## Verified` block with code references
-- [ ] All findings cross-checked against existing reviewer comments
-- [ ] No duplicates with other reviewers
-- [ ] Author pushback on existing comments evaluated for logical soundness
+- [ ] **Inline comments are issues only** — positive verifications go in the review body's `## Verified` block
+- [ ] Verified-safe patterns recorded in `## Verified` block with code references
+- [ ] All findings cross-checked against existing reviewer comments; no duplicates
+- [ ] Author pushback evaluated for logical soundness
 - [ ] Comments reference specific rules/docs (e.g., "Per AGENTS.md", "Per frontend-architecture.md §4")
-- [ ] **SDK parameters verified against actual Zod schema** in `node_modules` — not assumed from docs or parameter names
-- [ ] **JSONB column handling verified**: code processing JSONB values handles both object (DB read) and string (`JSON.stringify`) inputs
-- [ ] Tone is constructive, not prescriptive
 - [ ] Review body has no unintended signatures or names
 - [ ] Line numbers are correct (file lines, not diff lines)
 
@@ -576,3 +744,5 @@ Before posting, confirm:
 - Test-coverage expansion (upstream-request shape with negative `expect.not.objectContaining`, `vi.unstubAllGlobals()` cleanup, counter-based mock fragility, case-insensitive validation + `MAX_*` cap coverage) added after PR #1038 (`fix/connect-web-27-session-stream-abort`) and PR #869. The shape-locking rule is what catches refactors that drop `Authorization` / `Last-Event-ID` / `signal` from upstream calls without failing the suite (May 2026).
 - Sentry & Replay Configuration section added after PR #1039 (`fix/sentry-ignore-fetch-network-failure`) — `ignoreErrors` was filtering both replay buffers and tagged diagnostic captures. Switched to `beforeSend` with 1% canary sampling + tag-aware bypass; review checklist now requires auditing all `Sentry.captureException` sites for the bypass tag, documenting replay coupling, and using engine-agnostic constant names. Detailed patterns live in the dedicated `sentry-observability` skill (May 2026).
 - Frontend Rules expansion — date-only `timeZone: 'UTC'` rendering, `useMemo` of current time in modals, `useQuery`/`useMutation` defaults under polling, `meta.suppressGlobalError` cache asymmetry, status-enum forward-compat default branches, `typeof === 'string'` vs truthy for empty-string content, `getX({ id })` over `listX({ limit: 100 })`, mutation-error three-thing rule, shared-hook `renderHook` coverage, `router.refresh()` redundancy with `invalidateQueries` — added after PR #1068 (`V2-329/pr3-report-history-viewer`), six rounds of multi-reviewer feedback (CodeRabbit, Codex, Judge Codex, human reviewers) clustered around date/timezone drift, React Query defaults under polling × retry × N-viewer load, status-enum forward-compat, single-record API lookup shape, and mutation error completeness (May 2026).
+- Frontend Rules — legacy URL redirects on page consolidation, navigation consolidation test positive + negative assertions, e2e page object heading + tab-navigation alignment — added after PR #1208 (`AP-491/settings-tabbed-navigation`). Consolidating `/team` + `/organisation` into a tabbed `/settings` page surfaced three recurring gaps: (1) no `redirects()` in `next.config.ts` for deleted routes → old bookmarks 404; (2) `AppLayout.test.tsx` only asserted the new "Settings" link without negative assertions for removed "Organisation"/"Team" items; (3) e2e `SettingsPage.expectLoaded()` still matched `/team/i` and `goto()` defaulted to the wrong tab, breaking `analyst.setup.ts` and `brand-isolation.e2e.ts` flows (May 2026).
+- **Structural refactor** (May 2026): Reordered workflow to prioritize business context over code conventions. Added Step 0 (Business Context Gate), Step 2 (Business Flow Validation), Comment ROI Filter, Naming Quality section, and expanded Tone/Psychological Safety guidance. Restructured flat 60+ item checklist into domain-grouped sections (Pre-Review, Backend, Frontend, Sentry, Testing, Infra, Post-Review) with skip conditions. Fixed React key anti-pattern example, added verdict nuance for many P3s, and added `gh api` special-character note. Motivated by Dorin Baba's PR review principles — business context first, ROI of comments, naming matters, and psychological safety.
