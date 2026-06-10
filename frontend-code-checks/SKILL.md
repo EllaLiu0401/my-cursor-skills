@@ -22,35 +22,40 @@ Run the relevant check when:
 
 ### 1. Silent-catch — AGENTS.md §170
 
-**Never** `.catch(() => {})` or `try { ... } catch {}` except in these three cases:
+**Never** `.catch(() => {})` or `try { ... } catch {}` except in these cases:
 - `JSON.parse` / parse-or-fallback
 - Expected 404 → null
 - Cleanup / rollback before re-throwing
+- Terminating an `onClick`→`useActionMutate` fire-and-forget whose real errors the global `QueryProvider` pipeline already surfaces (see §1a)
 
-**Anti-pattern:**
+**Anti-pattern (swallowing an error that has no other handler):**
 ```tsx
-Promise.resolve(onAction(id)).catch(() => {});
+Promise.resolve(doThingWithNoGlobalHandler(id)).catch(() => {});
 ```
 
 **Fix:**
 ```tsx
-void onAction(id);
+void doThingWithNoGlobalHandler(id);
 ```
 
-Use `void` to satisfy `no-floating-promises` without swallowing. Errors should reach React Query `onError` / React error boundary / the global API error handler.
+Terminate the floating promise without swallowing real errors — they should reach React Query `onError` / React error boundary / the global API error handler. For the terminator choice (`void` vs `.catch(() => {})`), see §1a.
 
-#### 1a. `void` operator is the house style — do NOT "fix" it
+#### 1a. `void` vs `.catch(() => {})` — pick by context (not one global rule)
 
 `eslint.config.mjs` sets:
 - `@typescript-eslint/no-floating-promises: 'error'`
 - `no-void: ['error', { allowAsStatement: true }]`
 
-So `void asyncFn()` as an independent statement is **deliberate and required**. External tools (SonarQube `S3735`) will flag these as code smells — they're **false positives** in this repo. Confirm the rule with `rg 'no-floating-promises' eslint.config.mjs` before ever touching one.
+Both terminators satisfy `no-floating-promises`; the floating promise just has to be terminated somehow. Which one is correct depends on the call site — there is **no single house style**, and treating one as universal is what created the contradiction this rule replaces:
 
-- Do **not** refactor `void foo()` → `foo().catch(() => {})` — that violates rule §1 above.
+| Context | Terminator | Why |
+|---|---|---|
+| `onClick` / handler firing a `useActionMutate` mutation (often behind a `confirm()` dialog) as fire-and-forget | `.catch(() => {})` | SonarQube flags `void` here as **Critical (S905)**. The mutation's real errors already surface through the global `QueryProvider` pipeline; the empty catch only absorbs the dialog-cancel / unhandled-rejection noise. Established in `ReportConfigActions.tsx` (PR #837), re-confirmed in PR #1462. |
+| Any other independent floating-promise statement | `void asyncFn()` | Keeps errors flowing to the boundary; no swallow. |
+
+- Do **not** "fix" an existing `.catch(() => {})` on an `onClick`→`useActionMutate` path to `void` — that reintroduces the S905 finding. Confirm the precedent with `rg "\.catch\(\(\) => \{\}\)" apps/web/src/components/reports/ReportConfigActions.tsx`.
 - Do **not** refactor `void foo()` → `(async () => { await foo() })()` — unnecessary and less readable.
-- When SonarQube flags `void`, mark as `Won't fix` / `False positive` on Sonar instead of changing code.
-- The only acceptable change: if the callback was already `async`, drop the arrow wrapper and `await` directly.
+- The only acceptable change to a `void` statement: if the callback was already `async`, drop the arrow wrapper and `await` directly.
 
 ### 1b. No nested ternaries — SonarQube `S3358`
 
@@ -1274,6 +1279,113 @@ Then update all callers that need specific tab content to use the tab-aware meth
 
 This is harmless when the callback is only used in inline `onChange` handlers (no child depends on referential identity). Leave as-is to match the existing pattern in `ReportsTabs` / `IntegrationsTabs` — clean up across all tab components at once if ever needed.
 
+### 52. Long-poll loops: latch on terminal only, never on transient errors
+
+When a `useQuery` polls a long-running backend run (report generation, agent session, async job), the stop condition must be the run's **terminal state** (final artifact present / status failed), not query error state. Gating poll-stop or the error banner on `query.state.status === 'error'` freezes the viewer on a transient blip while the run is still in flight.
+
+**This refines §34** — keep `retry: false` for polls, but do NOT add the error state to `refetchInterval`'s stop condition.
+
+**Anti-pattern (PR #1557, first pass):**
+```ts
+refetchInterval: (query) =>
+  terminal || query.state.status === 'error' ? false : POLL_INTERVAL_MS,
+// a single 5xx mid-run latches polling off → viewer stuck on the error banner for minutes
+```
+
+**Fix — poll until terminal only; let transient errors self-heal:**
+```ts
+refetchInterval: () => (terminal ? false : POLL_INTERVAL_MS),
+retry: false,
+```
+
+Two companions:
+- **Reset latched state on key change.** `terminal` (or any latched poll-stop boolean) must reset when the polled id changes, or a reused hook instance stays frozen:
+  ```ts
+  useEffect(() => setTerminal(false), [sessionId]);
+  ```
+- **Gate the error banner on terminal**, so an in-flight blip keeps the progress UI:
+  ```tsx
+  if (isTerminal && (isError || htmlQuery.error)) return <LoadError />;
+  ```
+
+Reference pattern: `useWeeklyReports.ts`. Same recovery applies to a secondary content fetch (HTML body / presigned URL) — let it re-resolve a fresh URL on the next interval instead of latching on `htmlQuery.error`.
+
+### 53. Delayed loading skeleton: suppress the empty-state flash, announce it, keep paired components in sync
+
+When switching between async-loaded views (chat sessions, tabbed detail panes), a naive "clear content → show skeleton" flashes the host empty state before the skeleton paints.
+
+**Pattern (PR #1462):**
+- **Delay the skeleton** ~150ms so fast loads show nothing (`showSkeleton` flips after `SKELETON_DELAY_MS`).
+- **Suppress the host empty state for the whole loading window**, including the pre-skeleton delay:
+  ```tsx
+  emptyState={isLoading ? (showSkeleton ? <LoadingSkeleton /> : <></>) : emptyState}
+  ```
+  The `<></>` (not `undefined`) is what stops the host's "Start a conversation" / "Test your agent" card flashing in the 150ms gap.
+- **Announce it to assistive tech** — a visual-only skeleton that hides existing content needs `role="status"` + `aria-label={t('loading…')}` so screen readers report the transition.
+- **Keep paired components in sync.** When two components render the same surface (`ChatPage` + `AgentBuilderChat`), the loading guard must be identical in both. Fix one → fix the sibling in the same PR, or a reviewer flags "same symptom one component over".
+
+Prefer a single source of truth for the loading flag (one `loadingSessionId` / `isLoading` driving both the `messages=[]` pass-through and the empty-state suppression) over a second `hydrating` boolean that can diverge.
+
+### 54. Rendering untrusted / LLM-authored HTML in an iframe
+
+LLM-authored HTML (report bodies, transcript-derived content) is attacker-influenceable via prompt injection. `sandbox=""` alone is not enough.
+
+**What `sandbox=""` does and does not block (PR #1557):**
+- Blocks scripts, same-origin, forms, top-nav. ✅
+- Does **not** block passive subresource fetches — a prompt-injected `<img src="https://attacker/beacon">` still fires when the preview opens. ❌
+
+**Fix — inject an iframe-local CSP, placed before any content (byte order matters):**
+```ts
+const meta = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:;">`;
+// Anchor after a leading DOCTYPE (prepending before <!doctype> drops the doc into quirks mode and breaks layout);
+// fall back to a byte-0 prepend when there's no DOCTYPE.
+const doctype = html.match(/^\s*<!doctype[^>]*>/i);
+const srcDoc = doctype ? `${doctype[0]}${meta}${html.slice(doctype[0].length)}` : `${meta}${html}`;
+```
+A meta CSP only governs content parsed *after* it, so it must precede every resource tag — don't anchor it relative to `<head>` (a crafted doc can place a resource before `<head>`).
+
+**Sanitizer caveats (PR #1460):**
+- `sanitize-html` / DOMPurify do **not** strip CSS `@import` inside allowed `<style>` blocks by default — `@import "https://…"` still pulls external resources. Either drop `<style>` from `allowedTags` and inject theme CSS yourself, or post-strip `@import`.
+- DOMPurify default options (`WHOLE_DOCUMENT: false`) discard `<head>`, so an inline `<style>` in `<head>` is lost and the preview renders unstyled. Pass `{ WHOLE_DOCUMENT: true }` or keep styles in `<body>`.
+- When interpolating workspace/agent CSS into a server-side `<style>` tag, reject `</style` in the content — otherwise `</style><script>…` breaks out (PR #1460, `html-to-pdf-tool`).
+
+### 55. LLM output format: two-layer defense + safe normalization regex
+
+When UI depends on the LLM emitting a specific format (markdown links, tags, JSON), defend at both ends — the model is non-deterministic.
+
+**Pattern (PR #1434):**
+- **Layer 1 — prompt:** instruct the model to emit the canonical format and explicitly prohibit the wrong one (e.g. "use `[label](url)`, never Slack-style `<url|label>`").
+- **Layer 2 — consumer:** normalize/validate the output before rendering (e.g. regex-rewrite Slack-style links to markdown before `MarkdownViewer`).
+
+**When the normalizer is a regex over model/user content, verify three things:**
+- **No ReDoS** — bounded character classes, no nested quantifiers that backtrack.
+- **Anchored target** — anchor the URL/domain group (`https://connect\.composio\.dev/…`) so the rewrite can't be pointed at a spoofed host.
+- **Downstream gate** — a crafted label like `](javascript:alert(1))` will still produce a link; rely on the existing `SAFE_URL` (`/^(https?:\/\/|mailto:|tel:|[/#])/i`) anchor gate to reject `javascript:`, and keep its XSS test (`MessageList.test.tsx`) green.
+
+A module-level `/…/g` regex used with `String.prototype.replace()` is safe — `replace()` resets `lastIndex` each call; no stateful-regex bug to flag.
+
+### 56. Verify an internal async actually rejects before defending; don't let a blip erase rendered content
+
+**(a) Read the contract before defending (PR #1462).** Before adding `.catch(() => false)` / rollback handling to a call site, check whether the callee can even reject. `useChat.loadSession` has an internal `try/catch`, reports to Sentry, and **always resolves `boolean`** — it never rejects. Handling the `false` return (`then((ok) => { if (!ok) … })`) is sufficient; a call-site `.catch` is dead defensive code against a path that can't occur. Grep the implementation, don't assume.
+
+**(b) A transient error must not replace already-rendered content (PR #1557).** Order the render branches so an in-flight poll error doesn't blank out content the user already sees. Gate the error view on `!content` (and/or terminal state):
+```tsx
+if (reportHtml) return <Report html={reportHtml} />; // keep showing it through a blip
+if (isTerminal && isError) return <LoadError />;
+return <Progress />;
+```
+
+### 57. DS `Dropdown` trigger must be a non-button element
+
+The DS `Dropdown` renders its `trigger` inside a native `<summary>` (a `<details>`/`<summary>` disclosure). `<summary>` is already focusable, keyboard-activatable, and carries implicit button semantics, so nesting a `<button>` / `<Button>` inside it is invalid HTML (interactive content inside interactive content) and produces double button roles.
+
+**Use a styled non-interactive element as the trigger:**
+```tsx
+<Dropdown trigger={<span className="btn btn-primary btn-sm">{t('generate')}</span>}>
+```
+
+Accessibility is handled by the `<summary>`. Matches `UserProfileDropdown` / `ReportsHeaderActions` (PR #1557). Don't "fix" it to `<Button>`.
+
 ## Before-submission checklist
 
 Copy this at the end of a frontend task:
@@ -1281,7 +1393,7 @@ Copy this at the end of a frontend task:
 ```
 Frontend checks:
 - [ ] No `.catch(() => {})` / silent catch (AGENTS.md §170)
-- [ ] `void asyncFn()` statements kept as-is (house style, per eslint.config.mjs)
+- [ ] Floating-promise terminator chosen by §1a context — `.catch(() => {})` for `onClick`→`useActionMutate`, `void` elsewhere; don't refactor `void` → async IIFE
 - [ ] No nested ternaries (`a ? b : c ? d : e`) — extract helper or use if/else
 - [ ] No `<button>` / `<a>` nested inside another `<a>`
 - [ ] External `<img>` has loading="lazy" + referrerPolicy="no-referrer"
@@ -1333,6 +1445,12 @@ Frontend checks:
 - [ ] When deleting/consolidating page routes, legacy URL redirects added in `next.config.ts` (no dangling 404s for bookmarks)
 - [ ] Navigation consolidation tests have both positive (`Settings` link with correct href) AND negative (`Organisation`/`Team` not in document) assertions
 - [ ] E2e page object `expectLoaded()` matches the current page heading; tab-specific `gotoXTab()` methods added when page gains tabbed navigation
+- [ ] Long-poll queries latch on terminal state only (not query error); latched poll-stop state resets on key change; error banner gated on terminal
+- [ ] Loading skeletons delay-show, suppress the host empty state via `<></>` during the pre-skeleton window, carry `role="status"`, and stay identical across paired components
+- [ ] Untrusted/LLM HTML in an iframe has an iframe-local CSP before all content; sanitizer caveats (`@import`, DOMPurify `WHOLE_DOCUMENT`, `</style` breakout) handled
+- [ ] LLM-format-dependent UI defends at both prompt and consumer; normalization regex is ReDoS-safe, domain-anchored, and backed by the downstream `SAFE_URL` gate
+- [ ] No defensive `.catch()` against an internal async that never rejects (verified by reading the callee); transient poll errors don't replace already-rendered content
+- [ ] DS `Dropdown` trigger is a non-button element (`<span className="btn …">`), not `<Button>`
 - [ ] `pnpm turbo run typecheck --filter=@aetheronhq/web` PASS
 - [ ] `pnpm turbo run lint --filter=@aetheronhq/web` PASS
 - [ ] `pnpm turbo run test --filter=@aetheronhq/web` PASS
@@ -1357,5 +1475,7 @@ Frontend checks:
 - Rule §47 added after PR #1110 (`fix/sentry-test-env-leak`), where a `sentry.client.config.test.ts` mutation of `process.env.NEXT_PUBLIC_DEPLOYMENT_ENV` leaked into a sibling test file run minutes later, asserting prod-only Sentry behaviour in dev tests. Added the snapshot-and-restore pattern (or `vi.stubEnv` + `vi.unstubAllEnvs` for Vitest ≥1) (May 2026).
 
 - Rules §48–§51 added after PR #1208 (`AP-491/settings-tabbed-navigation`), where: (§48) deleting `/organisation/page.tsx` and `/team/page.tsx` without adding redirects left old bookmarks/links returning 404 — fixed by adding `permanent: false` redirects in `next.config.ts`; (§49) the AppLayout test only checked `getAllByText('Settings')` without asserting the old `Organisation` / `Team` nav items were gone — switched to `getAllByRole('link')` with href validation + negative assertions; (§50) e2e `SettingsPage.expectLoaded()` still matched `/team/i` after the page title changed to "Settings", and `goto()` defaulted to the Organisation tab so team-related e2e flows silently failed — added `gotoTeamTab()` and updated callers; (§51) `useCallback` with `useSearchParams()` in deps is a no-op since `useSearchParams()` returns a new instance each render — documented as harmless, matches existing tab patterns (May 2026).
+
+- §1a rewritten and Rules §52–§57 added after PRs #1462 (`AP-909/chat-skeleton-loading`), #1460 + #1557 (`cube-phase1 capability reports`), and #1434 (`AP-898/normalize-composio-links`): (§1a) the void-vs-`.catch` guidance was self-contradictory (§1 said use `void`, §1a said `void` is the only house style, but real reviews kept `.catch(() => {})`) — clarified by context: `onClick`→`useActionMutate` keeps `.catch(() => {})` because SonarQube flags `void` there as Critical S905, everything else uses `void`; (§52) `retry: false` + stop-poll-on-error froze report viewers mid-run on a transient 5xx — poll until terminal only, reset latched state on id change, gate the error banner on terminal; (§53) chat-session switches flashed the host empty state in the pre-skeleton window — delayed skeleton + `<></>` suppression + `role="status"` + paired-component symmetry; (§54) empty `sandbox=""` still let prompt-injected `<img>` beacons fire and `sanitize-html`/DOMPurify left `@import` / dropped `<head>` — iframe-local CSP before all content + sanitizer caveats; (§55) Slack-style Composio links needed prompt + consumer normalization with a ReDoS-safe, domain-anchored regex behind the `SAFE_URL` gate; (§56) reviewers asked for a `.catch()` on `loadSession` which never rejects, and a transient blip blanked already-rendered reports; (§57) the reports `Dropdown` trigger had to be a `<span className="btn">` because `<summary>` can't nest a `<button>` (Jun 2026).
 
 When new recurring reviewer comments appear on future PRs, extend this file rather than fixing the symptom once.

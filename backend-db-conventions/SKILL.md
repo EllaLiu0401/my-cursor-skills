@@ -58,6 +58,34 @@ export async function up(db: Kysely<unknown>): Promise<void> {
 // ADD VALUE is not reversible in Postgres — down is a no-op or recreate
 ```
 
+## Schema field & upsert patterns
+
+### Integer columns for sizes / counts / byte lengths
+
+A field representing a size, count, or byte length is a non-negative whole number. Use `Type.Integer({ minimum: 0 })`, never `Type.Number()` — `Type.Number()` accepts `1.5` and negatives, and the generated OpenAPI emits `number` instead of `integer`.
+
+```ts
+// BAD — accepts 1.5 / -3, OpenAPI says number
+fileSizeBytes: Type.Number();
+
+// GOOD
+fileSizeBytes: Type.Integer({ minimum: 0 });
+```
+
+### Tenant `ON CONFLICT` must match the partial unique index
+
+`createTenantTable` builds unique indexes as **partial** (`... WHERE deleted_at IS NULL`) so soft-deleted rows don't block re-inserts. An `onConflict` upsert must reproduce that predicate, or Postgres can't find a matching arbiter and throws at runtime — `there is no unique or exclusion constraint matching the ON CONFLICT specification`. Plan/typecheck pass; the insert fails in prod.
+
+```ts
+// BAD — no index matches (the real index is partial)
+.onConflict((oc) => oc.columns(['orgId', 'externalId']).doUpdateSet({ /* … */ }))
+
+// GOOD — mirror the partial index predicate
+.onConflict((oc) =>
+  oc.columns(['orgId', 'externalId']).where('deletedAt', 'is', null).doUpdateSet({ /* … */ }),
+)
+```
+
 ## JSONB Column Handling
 
 When reading JSONB columns via Kysely, the value is a **parsed JavaScript object** (or `null`), NOT a string. `kysely-codegen` types these as `Json | null` where `Json = JsonValue = JsonArray | JsonObject | JsonPrimitive`.
@@ -107,6 +135,22 @@ if (typeof parsed === 'object' && parsed !== null) {
 ### Tombstone resurrection must merge metadata
 
 When resurrecting a soft-deleted row, always **merge** metadata (spread existing + incoming), never overwrite. Critical fields like `slackAppId` in metadata are needed for cleanup flows. Overwriting creates unrecoverable orphans.
+
+### Filtering metadata keeps all JSON primitive types
+
+When whitelisting/copying metadata fields, keep every JSON primitive — `string`, `number`, `boolean` (and `null` if it carries meaning) — not just strings. A `typeof v === 'string'` filter silently drops numeric counters and boolean flags.
+
+```ts
+// BAD — drops numbers and booleans
+Object.fromEntries(Object.entries(meta).filter(([, v]) => typeof v === 'string'));
+
+// GOOD — keep all JSON primitives
+Object.fromEntries(
+  Object.entries(meta).filter(
+    ([, v]) => v === null || ['string', 'number', 'boolean'].includes(typeof v),
+  ),
+);
+```
 
 ## API mappers & runtime patterns
 
@@ -184,6 +228,26 @@ const chatTitle = streamedChatTitle ?? extractChatTitle(result.output);
 
 **Test it:** fixture with three turns where the title appears in turn 1, a tool call in turn 2, and a summary in turn 3. Assert the title is captured. Add a "last seen wins" fixture where turns 1 and 3 both emit titles — assert turn 3's wins.
 
+### System-row lookups must be fully qualified, not slug-only
+
+When resolving a shared "system" row (system agent, stable template, platform default) through a system-rows query helper, filter on the full identity — `isSystem = true` **and** `channel = 'stable'` **and** the system org — not just a human-editable `slug` / `name`. A slug-only match can collide with a tenant row that reuses the slug, or pick up a non-stable draft.
+
+**Anti-pattern (PR #1460 / #1557):**
+```ts
+// slug alone — a tenant row or a draft channel can shadow the system row
+selectFromWithSystemRows('agents').where('slug', '=', slug);
+```
+
+**Fix — pin the full system identity:**
+```ts
+selectFromWithSystemRows('agents')
+  .where('isSystem', '=', true)
+  .where('channel', '=', 'stable')
+  .where('slug', '=', slug);
+```
+
+**Apply when:** any lookup of platform-owned shared rows. The slug is operator-editable, so it is never a sufficient key on its own.
+
 ## Key References
 
 - `planning/db-conventions.md` — full DB conventions (source of truth)
@@ -195,3 +259,4 @@ const chatTitle = streamedChatTitle ?? extractChatTitle(result.output);
 - JSONB handling, `as`-assertion ban, and metadata merge rules added after PR #919 (`feat/composio-org-level-sync`), where `typeof existing !== 'string'` silently skipped metadata merge for Kysely-sourced JSONB objects, losing `slackAppId` during tombstone resurrection (Apr 2026).
 - "Strip null JSONB fields in API response mappers" added after PR #1116 (`fix/hotel-sms-toggle-state-source-of-truth`), where the FE rendered the SMS section as enabled because the API mapper let fast-json-stringify serialize `null` JSONB fields as `{}` (May 2026).
 - "Multi-turn agent runs: capture per turn" added after PR #1071 (`fix(workloads): persist chat title from any assistant turn (VP-199)`), where `extractChatTitle(result.output)` returned `null` whenever the title appeared in an early turn and a later turn was a tool call (May 2026).
+- Schema field & upsert patterns ("Integer columns", "Tenant `ON CONFLICT` must match the partial unique index"), "Filtering metadata keeps all JSON primitive types", and "System-row lookups must be fully qualified" added after PRs #1460 + #1557 (`cube-phase1 capability reports`): `Type.Number()` was used for byte/size fields; an `onConflict` upsert omitted the `WHERE deleted_at IS NULL` predicate that `createTenantTable`'s partial unique index carries (runtime "no unique constraint matching"); a metadata filter dropped non-string primitives; and system agent/template lookups matched on slug alone instead of the full `isSystem` + `channel = 'stable'` + system-org identity (Jun 2026).

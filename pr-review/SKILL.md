@@ -168,6 +168,7 @@ Check against all rules read from AGENTS.md. Common violations to watch for:
 - Terraform: update module README when changing variables/resources/scopes
 - No client-side secrets (`NEXT_PUBLIC_*` forbidden)
 - **Specialized helper preference** — when a helper family exists (`with-system-db.ts` exports `withSystemDb` + `withBootstrapSystemDb`; `with-scoped-db.ts` exports `withScopedDb` + `withScopedDbForOrg` + ...), the most specific helper wins. A bootstrap path manually constructing a `SystemDbContext` and calling `withSystemDb(ctx, fn)` should be `withBootstrapSystemDb(reason, fn)` — review-time check: `rg "withSystemDb\\(" apps/api/src` and audit each site for whether a more specific helper applies (PR #1059).
+- **No runtime reads of repo-root files in bundled / Lambda code** — code that runs in a bundled Lambda (or any artifact that doesn't ship the repo tree) must not `readFile` / `readdir` a path relative to `process.cwd()` / the repo root at runtime; the file isn't in the bundle. Inline the content as a code constant, or load it from a packaged asset / S3. Flag any `readFileSync(join(process.cwd(), ...))` on an `apps/api` / `apps/workloads` runtime path (PR #1460 / #1557).
 
 ### Behavioral Change Flagging
 
@@ -192,6 +193,8 @@ When code changes observable behavior (not just refactoring), explicitly flag it
 - **Hydration readiness side-effect gaps**: When an effect marks a namespace/state as PENDING, every branch must either mark it READY or intentionally keep it blocked with a user-visible reason. Early returns for stale `sessionId`, selected-session bypasses, missing stored ids, or superseded loads must be traced so persistence watchers do not silently drop new state.
 - **Cancelled load cleanup gaps**: If a namespace/key change cancels an in-flight async load, verify the new run resets loading/hydrating state before any early return. Otherwise the old `.finally()` may skip cleanup due to `cancelled=true`, and the new empty namespace may suppress the empty state forever.
 - **Framework-level race prevention**: Before flagging a timing race condition, verify whether the framework prevents it internally. E.g., Next.js `router.replace` wraps navigation in `startTransition` and uses an action queue that **discards** superseded pending navigations (`app-router-instance.js` `dispatchAction`). Consecutive rapid `router.replace` calls don't produce intermediate `searchParams` values — the old navigate is discarded before its state is committed. Read the framework source when official docs are silent on internal behavior. Don't flag theoretical race conditions that the framework's architecture prevents.
+- **No external network I/O inside the request-scoped DB lifecycle**: A request's `db()` holds a pooled connection for the handler's duration; awaiting a slow external call (PMS, Composio, S3 upload) mid-handler pins that connection and starves the pool under load. Move post-commit side effects to an `afterCommit` hook / queue so the connection is released before the network call runs (PR #1557).
+- **Independent post-commit (`afterCommit`) callbacks**: When multiple post-commit side effects are registered, each must be isolated — one throwing must not skip the others. Wrap each in its own `try/catch` (log + continue) rather than `await a(); await b();` where `a`'s failure drops `b` (PR #1557).
 - **Global state vs error-shape discriminators in catch blocks**: When a catch block uses _global state_ (`request.signal.aborted`, module-level flags, request-scoped booleans) to decide how to handle an error, verify no other error path can reach the same state. E.g., `request.signal.aborted === true` holds for any error that happens after a client disconnect — including genuine upstream failures (DNS, ECONNREFUSED, TLS) that coincided with the disconnect — causing silent swallowing of real bugs. Prefer error-shape discriminators: `err instanceof DOMException && err.name === 'AbortError'`. This matches the codebase's existing pattern in `useChat.ts:605` / `useChat.ts:723` / `query-retry.ts:43`.
 
 ### External API Integration
@@ -212,6 +215,8 @@ When code changes observable behavior (not just refactoring), explicitly flag it
 - **Error fallbacks weakening security**: If a delete/refresh flow treats `NotFoundError` as "already gone, skip cleanup", then converting transient errors to `NotFoundError` means transient failures silently skip cleanup. Narrow the catch to the exact 404-equivalent.
 - **Tenant isolation on new patterns**: When introducing `includeDeleted`, `withTombstones`, or similar query modifiers, verify they don't bypass the `orgId` tenant filter. Read the actual `ScopedDb` implementation to confirm.
 - **Default-deny direction of failures**: When a safety cap (e.g., MAX_PAGES) truncates data, the failure direction matters. For ownership verification, truncation should result in `NotFoundError` (deny access), not silent pass-through. For data listing, truncation loses data but doesn't open a security hole — log a warning.
+- **Symlink / path-traversal escape on filesystem reads**: Server code that resolves a user- or config-derived path under a base directory must canonicalize and re-check containment — `path.join` + a `startsWith(base)` check is bypassable via `..` and symlinks. Use `fs.realpath()` (resolves symlinks) then assert the resolved path is still under the base, and `lstat()` to reject symlinks before reading. Applies to template loaders, attachment fetchers, any `readFile(userControlledSegment)` (PR #1460).
+- **Rendering LLM / untrusted HTML**: `sandbox=""` alone does not stop passive subresource beacons (`<img src>`); require an iframe-local CSP placed before all content, and verify the sanitizer strips CSS `@import` / preserves `<head>`. See `frontend-code-checks` §54 (PR #1460 / #1557).
 
 ### Operational Readiness
 
@@ -253,6 +258,8 @@ When a PR touches API response mappers or agent-runner code, also check `backend
 
 - **Strip null JSONB before serialization**: `fast-json-stringify` can emit `{}` for runtime `null` JSONB values, which the FE then mis-reads as "feature enabled". Mapper must explicitly skip `null` keys, or the TypeBox schema must declare `Type.Union([..., Type.Null()])` (PR #1116).
 - **Multi-turn agent capture per turn**: Code reading structured tags (`<chat_title>`, citations, telemetry) from agent runs must walk every assistant message during the stream — `result.output` is whatever the final turn was, often a tool call. Use a "last seen wins" comment to document the choice (PR #1071).
+- **System-row lookups fully qualified**: shared system rows (system agent, stable template, platform default) must be filtered on `isSystem` + `channel = 'stable'` + system org, not slug alone — slug is operator-editable and can be shadowed by a tenant row or a draft. See `backend-db-conventions` "System-row lookups" (PR #1460 / #1557).
+- **Integer schema fields + tenant `ON CONFLICT` predicate**: size/count/byte fields use `Type.Integer({ minimum: 0 })`, not `Type.Number()`; an upsert's `onConflict` must mirror `createTenantTable`'s partial unique index (`WHERE deleted_at IS NULL`) or it throws "no unique constraint matching" at runtime. See `backend-db-conventions` (PR #1460).
 
 ### Cross-Service Data Consistency
 
@@ -368,6 +375,7 @@ When a PR touches API response mappers or agent-runner code, also check `backend
 - **Response envelope consistency**: List endpoints use `{ items: [...] }` or `{ data: [...] }` per convention.
 - **`required` + nullable vs `Optional` for nullable DB columns**: When promoting a nullable DB column to the response schema, default to `required` + `T | null` (e.g. `Type.Union([Type.String(), Type.Null()])` in the response object plus the field name in `required`). Meaning: the key is **always present** in the JSON, the value can be `null`. `Optional(...)` means the key may be **absent entirely**, which breaks client type safety unless they handle `key in obj` checks. Reference: `title`, `sourceKey`, `lastEventAt` in `SessionDto`. Flag any `Optional` on a nullable DB column that has no semantic "key may be absent" justification (PR #992).
 - **`?? null` redundancy**: `kysely-codegen` types nullable columns as `T | null` already, so `row.foo ?? null` in a mapper is dead code — flag for removal to keep the mapper consistent with surrounding nullable fields (PR #992).
+- **Validate cross-field semantic constraints at the route boundary**: TypeBox type-checks each field in isolation, but relationships between fields (`periodStart <= periodEnd`, `min <= max`, non-overlapping ranges) must be asserted in the handler and rejected with a `400 ValidationError` — not left to surface as a downstream 500 or a nonsensical empty result (PR #1557).
 
 ### Testing
 
@@ -463,6 +471,12 @@ For each issue found:
 - **Weak pushback**: "Not a real issue — X is always Y" without citing the type definition or SDK source (violates evidence-based principle).
 
 When the author pushes back and cites evidence (SDK types, actual runtime behavior), accept the pushback. When the author pushes back with speculation, ask for the evidence.
+
+**Legitimate "won't fix" — verify the real trigger before insisting (don't bloat for hypotheticals):**
+- **"No concurrent writer exists, so no lock / `ON CONFLICT` needed"** — valid when the write path is single-producer (one queue consumer, one cron) with no second path on the same key. Don't insist on `SELECT FOR UPDATE` / `ON CONFLICT` without naming the concurrent caller (PR #1557).
+- **"This async never rejects, so no `.catch` needed"** — valid when you've read the callee and it has an internal `try/catch` that always resolves (e.g. `loadSession` → `boolean`). Verify by reading the implementation; if it can't reject, a `.catch` is dead defensive code (PR #1462).
+- **"`lastError` already surfaces this, so no poll-timeout needed"** — valid when an existing error field already drives the user-visible failure state; a separate timeout is redundant machinery (PR #1557).
+- **"RLS + a sibling FK already constrain this, so no extra ownership check"** — when a sibling id (e.g. `assistantId`) is already constrained by RLS / an FK to the tenant, an explicit call-site ownership check duplicates the boundary. Don't add it without a real cross-tenant path (PR #1557).
 
 ### Comment ROI Filter
 
@@ -678,6 +692,12 @@ Grouped by domain. **Skip sections that don't apply to the PR's scope.**
 - [ ] **`?? null` redundancy removed** on `kysely-codegen` `T | null` fields
 - [ ] **SDK parameters verified against actual Zod schema** in `node_modules`
 - [ ] **JSONB column handling verified**: handles both object (DB read) and string (`JSON.stringify`) inputs
+- [ ] **No external network I/O inside the request-scoped DB lifecycle** — slow calls moved to `afterCommit` / queue; multiple post-commit callbacks each isolated in their own try/catch
+- [ ] **No runtime reads of repo-root files** in bundled/Lambda code — content inlined or loaded from a packaged asset / S3
+- [ ] **Filesystem path inputs canonicalized** with `realpath` + containment check (+ `lstat` symlink reject)
+- [ ] **Cross-field semantic constraints validated** at the route boundary (→ 400), not left to a downstream 500
+- [ ] **System-row lookups fully qualified** (`isSystem` + stable channel + system org), not slug-only
+- [ ] **Integer schema fields** use `Type.Integer({ minimum: 0 })`; tenant `ON CONFLICT` predicate mirrors the partial unique index (`WHERE deleted_at IS NULL`)
 - [ ] External API constraints verified via docs (URLs cited where applicable)
 
 ### Frontend (skip if backend-only PR)
@@ -699,6 +719,9 @@ Grouped by domain. **Skip sections that don't apply to the PR's scope.**
 - [ ] **No `router.refresh()` alongside `invalidateQueries`** for the same data
 - [ ] **Legacy URL redirects present** when pages are deleted/consolidated
 - [ ] **React hydration/persistence effects checked**: Effect deps are true trigger values, self-canceling state writes are not deps
+- [ ] **Untrusted/LLM HTML** rendered with an iframe-local CSP placed before content; sanitizer `@import` / `<head>` caveats handled (see `frontend-code-checks` §54)
+- [ ] **Long-poll queries** latch on terminal state only (not query error); latched state resets on key change; error banner gated on terminal
+- [ ] **DS `Dropdown` trigger** is a non-button element (`<span className="btn …">`), not `<Button>`
 
 ### Sentry & Observability (skip if no Sentry/logging changes)
 - [ ] **Sentry `beforeSend` filter audited** for tag-aware bypass coverage and replay-coupling documentation
@@ -745,4 +768,5 @@ Grouped by domain. **Skip sections that don't apply to the PR's scope.**
 - Sentry & Replay Configuration section added after PR #1039 (`fix/sentry-ignore-fetch-network-failure`) — `ignoreErrors` was filtering both replay buffers and tagged diagnostic captures. Switched to `beforeSend` with 1% canary sampling + tag-aware bypass; review checklist now requires auditing all `Sentry.captureException` sites for the bypass tag, documenting replay coupling, and using engine-agnostic constant names. Detailed patterns live in the dedicated `sentry-observability` skill (May 2026).
 - Frontend Rules expansion — date-only `timeZone: 'UTC'` rendering, `useMemo` of current time in modals, `useQuery`/`useMutation` defaults under polling, `meta.suppressGlobalError` cache asymmetry, status-enum forward-compat default branches, `typeof === 'string'` vs truthy for empty-string content, `getX({ id })` over `listX({ limit: 100 })`, mutation-error three-thing rule, shared-hook `renderHook` coverage, `router.refresh()` redundancy with `invalidateQueries` — added after PR #1068 (`V2-329/pr3-report-history-viewer`), six rounds of multi-reviewer feedback (CodeRabbit, Codex, Judge Codex, human reviewers) clustered around date/timezone drift, React Query defaults under polling × retry × N-viewer load, status-enum forward-compat, single-record API lookup shape, and mutation error completeness (May 2026).
 - Frontend Rules — legacy URL redirects on page consolidation, navigation consolidation test positive + negative assertions, e2e page object heading + tab-navigation alignment — added after PR #1208 (`AP-491/settings-tabbed-navigation`). Consolidating `/team` + `/organisation` into a tabbed `/settings` page surfaced three recurring gaps: (1) no `redirects()` in `next.config.ts` for deleted routes → old bookmarks 404; (2) `AppLayout.test.tsx` only asserted the new "Settings" link without negative assertions for removed "Organisation"/"Team" items; (3) e2e `SettingsPage.expectLoaded()` still matched `/team/i` and `goto()` defaulted to the wrong tab, breaking `analyst.setup.ts` and `brand-isolation.e2e.ts` flows (May 2026).
+- Security (symlink/path-traversal escape, rendering LLM/untrusted HTML), Concurrency/Operational (no external network I/O inside the request-scoped DB lifecycle, independent `afterCommit` callbacks), Architecture (no runtime reads of repo-root files in bundled/Lambda code), Schema & API (cross-field semantic validation at the route boundary, system-row lookups fully qualified, `Type.Integer` + tenant `ON CONFLICT` partial-index predicate), and four Step-4 "won't fix" pushback examples (no concurrent writer, async that never rejects, `lastError` already covers, RLS/FK already constrains) added after PRs #1460 + #1557 (`cube-phase1 capability reports`), #1462 (`AP-909/chat-skeleton-loading`), and #1434 (`AP-898/normalize-composio-links`). Frontend-side specifics (long-poll terminal latching, untrusted-HTML iframe CSP, DS `Dropdown` trigger, void-vs-`.catch`) live in `frontend-code-checks` §1a/§52–§57; DB-side (Integer fields, `ON CONFLICT` predicate, metadata primitives, system-row identity) in `backend-db-conventions` (Jun 2026).
 - **Structural refactor** (May 2026): Reordered workflow to prioritize business context over code conventions. Added Step 0 (Business Context Gate), Step 2 (Business Flow Validation), Comment ROI Filter, Naming Quality section, and expanded Tone/Psychological Safety guidance. Restructured flat 60+ item checklist into domain-grouped sections (Pre-Review, Backend, Frontend, Sentry, Testing, Infra, Post-Review) with skip conditions. Fixed React key anti-pattern example, added verdict nuance for many P3s, and added `gh api` special-character note. Motivated by Dorin Baba's PR review principles — business context first, ROI of comments, naming matters, and psychological safety.
